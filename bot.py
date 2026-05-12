@@ -30,6 +30,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN не найден. Создай файл .env и положи туда токен.")
 
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+dp.include_router(router)
+
 # Список ID админов через запятую: ADMIN_IDS=123456,789012
 ADMIN_IDS = set()
 admin_ids_raw = os.getenv("ADMIN_IDS", "")
@@ -173,12 +179,6 @@ class BanMiddleware(BaseMiddleware):
 
 dp.message.middleware(BanMiddleware())
 dp.callback_query.middleware(BanMiddleware())
-
-logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-dp = Dispatcher(storage=MemoryStorage())
-router = Router()
-dp.include_router(router)
 
 
 # ----------- Состояния анкеты (FSM) -----------
