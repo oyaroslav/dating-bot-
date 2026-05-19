@@ -186,7 +186,8 @@ class Form(StatesGroup):
     name = State()
     age = State()
     gender = State()
-    looking_for = State()
+    partner_age_min = State()
+    partner_age_max = State()
     city = State()
     church = State()
     marital = State()
@@ -231,16 +232,6 @@ def swipe_kb(photo_idx: int = 0, photos_total: int = 1) -> InlineKeyboardMarkup:
 def gender_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="Мужчина"), KeyboardButton(text="Женщина")]],
-        resize_keyboard=True, one_time_keyboard=True,
-    )
-
-
-def looking_for_kb(gender: str) -> ReplyKeyboardMarkup:
-    """Показываем только противоположный пол.
-    Мужчине — кнопку «Женщин», женщине — кнопку «Мужчин»."""
-    button = KeyboardButton(text="Женщин") if gender == "M" else KeyboardButton(text="Мужчин")
-    return ReplyKeyboardMarkup(
-        keyboard=[[button]],
         resize_keyboard=True, one_time_keyboard=True,
     )
 
@@ -364,29 +355,60 @@ async def form_gender(message: Message, state: FSMContext):
         await message.answer("Выбери из кнопок.", reply_markup=gender_kb())
         return
     gender = "M" if message.text == "Мужчина" else "F"
-    await state.update_data(gender=gender)
-    # Автоматически устанавливаем поиск противоположного пола.
-    # Однополый поиск в этом боте не предусмотрен.
+    # В христианском боте: мужчина ищет женщину, женщина — мужчину.
+    # Это устанавливается автоматически без отдельного вопроса.
     opposite = "F" if gender == "M" else "M"
-    await state.update_data(looking_for=opposite)
-    prompt = ("<b>Кого ищешь?</b>\nДля подтверждения нажми кнопку ниже."
-              if gender == "M"
-              else "<b>Кого ищешь?</b>\nДля подтверждения нажми кнопку ниже.")
-    await message.answer(prompt, reply_markup=looking_for_kb(gender))
-    await state.set_state(Form.looking_for)
+    await state.update_data(gender=gender, looking_for=opposite)
+
+    partner = "девушки" if gender == "M" else "молодого человека"
+    await message.answer(
+        f"<b>Минимальный возраст {partner}?</b>\n"
+        f"Например: 22",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.set_state(Form.partner_age_min)
 
 
-@router.message(Form.looking_for)
-async def form_looking_for(message: Message, state: FSMContext):
+@router.message(Form.partner_age_min)
+async def form_partner_age_min(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Напиши возраст числом, например: 22")
+        return
+    age_min = int(message.text.strip())
+    if not (18 <= age_min <= 99):
+        await message.answer("Возраст должен быть от 18 до 99.")
+        return
+    await state.update_data(partner_age_min=age_min)
+
     data = await state.get_data()
     gender = data.get("gender")
-    expected = "Женщин" if gender == "M" else "Мужчин"
-    if message.text != expected:
-        await message.answer("Нажми на кнопку.", reply_markup=looking_for_kb(gender))
+    partner = "девушки" if gender == "M" else "молодого человека"
+    await message.answer(
+        f"<b>Максимальный возраст {partner}?</b>\n"
+        f"Например: 40"
+    )
+    await state.set_state(Form.partner_age_max)
+
+
+@router.message(Form.partner_age_max)
+async def form_partner_age_max(message: Message, state: FSMContext):
+    if not message.text or not message.text.strip().isdigit():
+        await message.answer("Напиши возраст числом, например: 40")
         return
-    # looking_for уже установлен в form_gender, просто переходим дальше
-    await message.answer("<b>Из какого ты города?</b>",
-                         reply_markup=ReplyKeyboardRemove())
+    age_max = int(message.text.strip())
+    if not (18 <= age_max <= 99):
+        await message.answer("Возраст должен быть от 18 до 99.")
+        return
+    data = await state.get_data()
+    age_min = data.get("partner_age_min", 18)
+    if age_max < age_min:
+        await message.answer(
+            f"Максимальный возраст не может быть меньше минимального ({age_min}). "
+            f"Введи число от {age_min}."
+        )
+        return
+    await state.update_data(partner_age_max=age_max)
+    await message.answer("<b>Из какого ты города?</b>")
     await state.set_state(Form.city)
 
 
@@ -530,6 +552,8 @@ async def form_photo_done(call: CallbackQuery, state: FSMContext):
         age=data["age"],
         gender=data["gender"],
         looking_for=data["looking_for"],
+        partner_age_min=data["partner_age_min"],
+        partner_age_max=data["partner_age_max"],
         city=data["city"],
         church=data["church"],
         marital=data["marital"],
@@ -778,7 +802,15 @@ async def my_profile(message: Message):
     if not photos:
         photos = [u["photo_id"]]
 
+    # К стандартной подписи добавляем личный фильтр по возрасту партнёра
+    # (его видит только сам пользователь — другим это не показывается)
     caption = format_profile(u)
+    age_min = u.get("partner_age_min")
+    age_max = u.get("partner_age_max")
+    if age_min and age_max:
+        partner = "девушки" if u["gender"] == "M" else "молодого человека"
+        caption += f"\n\n🔎 <b>Ищу возраст {partner}:</b> {age_min}–{age_max} лет"
+
     if len(photos) == 1:
         await message.answer_photo(photos[0], caption=caption,
                                    reply_markup=main_menu_kb())
@@ -820,11 +852,13 @@ async def notify_admins_about_report(reporter_id: int, target_id: int, total: in
     reporter_name = reporter["name"] if reporter else f"id {reporter_id}"
     text = (
         f"🚩 <b>Новая жалоба</b>\n\n"
-        f"От: <b>{reporter_name}</b> (id {reporter_id})\n"
-        f"На: <b>{target_name}</b> (id {target_id})\n"
+        f"От: <b>{reporter_name}</b> (id <code>{reporter_id}</code>)\n"
+        f"На: <b>{target_name}</b> (id <code>{target_id}</code>)\n"
         f"Всего жалоб на этого пользователя: <b>{total}</b>\n\n"
-        f"Чтобы посмотреть анкету: <code>/baninfo {target_id}</code>\n"
-        f"Чтобы забанить: <code>/ban {target_id} причина</code>"
+        f"<b>Действия:</b>\n"
+        f"• Анкета нарушителя: <code>/userinfo {target_id}</code>\n"
+        f"• Кто жалуется: <code>/userinfo {reporter_id}</code>\n"
+        f"• Забанить: <code>/ban {target_id} причина</code>"
     )
     for admin_id in ADMIN_IDS:
         try:
@@ -841,6 +875,8 @@ async def cmd_admin(message: Message):
         return
     await message.answer(
         "<b>Админ-команды:</b>\n\n"
+        "<code>/stats</code> — статистика бота\n"
+        "<code>/userinfo ID</code> — полное досье на пользователя\n"
         "<code>/ban ID причина</code> — забанить пользователя\n"
         "<code>/unban ID</code> — разбанить\n"
         "<code>/banlist</code> — список забаненных\n"
@@ -848,6 +884,59 @@ async def cmd_admin(message: Message):
         "<code>/reports</code> — последние жалобы\n\n"
         f"Твой ID: <code>{message.from_user.id}</code>"
     )
+
+
+# ----------- /stats -----------
+@router.message(Command("stats"))
+async def cmd_stats(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    s = await db.get_stats()
+
+    def fmt_top(items: list, label: str) -> str:
+        if not items:
+            return f"<i>нет {label}</i>"
+        return "\n".join(f"  {i+1}. {name} — {cnt}"
+                         for i, (name, cnt) in enumerate(items))
+
+    text = (
+        "📊 <b>Статистика бота</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+
+        "👥 <b>Пользователи</b>\n"
+        f"  Всего анкет: <b>{s['users_total']}</b>\n"
+        f"  ├ Мужчин: {s['users_male']}\n"
+        f"  └ Женщин: {s['users_female']}\n"
+        f"\n"
+        f"  Новых за 24 часа: <b>+{s['users_24h']}</b>\n"
+        f"  Новых за 7 дней: +{s['users_7d']}\n"
+        f"  Новых за 30 дней: +{s['users_30d']}\n"
+        f"  Активных за 7 дней: {s['users_active_7d']}\n\n"
+
+        "💫 <b>Активность</b>\n"
+        f"  Всего свайпов: <b>{s['swipes_total']}</b>\n"
+        f"  ├ ❤️ Лайков: {s['likes_total']}\n"
+        f"  └ ❌ Дизлайков: {s['dislikes_total']}\n"
+        f"  Конверсия лайков: {s['like_rate']}%\n"
+        f"  Свайпов за 24 часа: <b>{s['swipes_24h']}</b>\n\n"
+
+        "💕 <b>Матчи</b>\n"
+        f"  Всего пар: <b>{s['matches_total']}</b>\n"
+        f"  За 24 часа: +{s['matches_24h']}\n"
+        f"  За 7 дней: +{s['matches_7d']}\n\n"
+
+        "🏙 <b>Топ городов</b>\n"
+        f"{fmt_top(s['top_cities'], 'данных')}\n\n"
+
+        "⛪ <b>Топ церквей</b>\n"
+        f"{fmt_top(s['top_churches'], 'данных')}\n\n"
+
+        "🛡 <b>Модерация</b>\n"
+        f"  Жалоб всего: {s['reports_total']}\n"
+        f"  Жалоб за 24 часа: <b>{s['reports_24h']}</b>\n"
+        f"  Забанено: {s['banned_total']}"
+    )
+    await message.answer(text)
 
 
 @router.message(Command("ban"))
@@ -963,6 +1052,97 @@ async def cmd_baninfo(message: Message):
         await message.answer_photo(u["photo_id"], caption=caption)
     except Exception:
         await message.answer(caption)
+
+
+# ----------- /userinfo — полное досье на пользователя -----------
+@router.message(Command("userinfo"))
+async def cmd_userinfo(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].isdigit():
+        await message.answer("Использование: <code>/userinfo ID</code>")
+        return
+    target_id = int(parts[1])
+    info = await db.get_user_info(target_id)
+    u = info["profile"]
+    ban = info["ban"]
+
+    # Статус
+    if ban:
+        status = f"⛔ <b>Забанен</b> — {ban['reason'] or 'без причины'}"
+    else:
+        status = "✅ <b>Активен</b>"
+
+    # Соотношение лайков/дизлайков (как разборчив)
+    my_total = info["my_likes"] + info["my_dislikes"]
+    my_like_pct = (
+        round(100 * info["my_likes"] / my_total, 1) if my_total > 0 else 0
+    )
+
+    received_total = info["likes_received"] + info["dislikes_received"]
+    received_like_pct = (
+        round(100 * info["likes_received"] / received_total, 1)
+        if received_total > 0 else 0
+    )
+
+    # Сигнал тревоги, если жалоб подаёт неадекватно много относительно активности
+    suspicious_reporter = ""
+    if info["my_reports"] >= 5 and my_total > 0:
+        report_rate = round(100 * info["my_reports"] / my_total, 1)
+        if report_rate > 30:
+            suspicious_reporter = (
+                f"\n⚠️ <b>Подозрительно много жалоб</b>: "
+                f"{info['my_reports']} жалоб на {my_total} свайпов ({report_rate}%)"
+            )
+
+    body = (
+        f"{status}\n"
+        f"id: <code>{target_id}</code>\n"
+    )
+
+    if u:
+        body += (
+            f"@{u['username'] or '(нет username)'}\n\n"
+            f"<b>{u['name']}, {u['age']}</b>\n"
+            f"📍 {u['city']}\n"
+            f"⛪ {u['church']}\n"
+            f"💍 {u['marital']}\n"
+            f"👶 {u['children']}\n"
+            f"📅 Зарегистрирован: {u['created_at']}\n\n"
+            f"<b>О себе:</b>\n{u['hobbies']}\n"
+        )
+    else:
+        body += "\n<i>Анкеты нет</i>\n"
+
+    body += (
+        f"\n━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Его активность</b>\n"
+        f"  ❤️ Лайков поставил: {info['my_likes']}\n"
+        f"  ❌ Дизлайков поставил: {info['my_dislikes']}\n"
+        f"  Доля лайков: {my_like_pct}%\n"
+        f"  🚩 Жалоб подал: <b>{info['my_reports']}</b>\n"
+        f"  💕 Матчей: {info['matches']}\n"
+        f"  Последний свайп: {info['last_active'] or 'нет данных'}\n\n"
+        f"📥 <b>Что получил от других</b>\n"
+        f"  ❤️ Лайков получил: {info['likes_received']}\n"
+        f"  ❌ Дизлайков получил: {info['dislikes_received']}\n"
+        f"  Привлекательность: {received_like_pct}%\n"
+        f"  🚩 Жалоб на него: <b>{info['reports_against']}</b>"
+        f"{suspicious_reporter}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"Действия: <code>/ban {target_id} причина</code> · "
+        f"<code>/unban {target_id}</code>"
+    )
+
+    # Если есть фото — шлём с фото, иначе текстом
+    if u and u.get("photo_id"):
+        try:
+            await message.answer_photo(u["photo_id"], caption=body)
+            return
+        except Exception:
+            pass  # caption может быть длиннее лимита — упадём в текстовый
+    await message.answer(body)
 
 
 @router.message(Command("reports"))

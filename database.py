@@ -14,19 +14,21 @@ async def init_db():
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.executescript("""
             CREATE TABLE IF NOT EXISTS users (
-                user_id     INTEGER PRIMARY KEY,
-                username    TEXT,
-                name        TEXT NOT NULL,
-                age         INTEGER NOT NULL,
-                gender      TEXT NOT NULL,           -- 'M' / 'F'
-                looking_for TEXT NOT NULL,           -- 'M' / 'F' (только противоположный пол)
-                city        TEXT NOT NULL,
-                church      TEXT NOT NULL,
-                marital     TEXT NOT NULL,
-                children    TEXT NOT NULL,
-                hobbies     TEXT NOT NULL,
-                photo_id    TEXT NOT NULL,           -- главное фото (обложка)
-                created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                user_id          INTEGER PRIMARY KEY,
+                username         TEXT,
+                name             TEXT NOT NULL,
+                age              INTEGER NOT NULL,
+                gender           TEXT NOT NULL,           -- 'M' / 'F'
+                looking_for      TEXT NOT NULL,           -- 'M' / 'F' (только противоположный пол)
+                partner_age_min  INTEGER NOT NULL DEFAULT 18,
+                partner_age_max  INTEGER NOT NULL DEFAULT 99,
+                city             TEXT NOT NULL,
+                church           TEXT NOT NULL,
+                marital          TEXT NOT NULL,
+                children         TEXT NOT NULL,
+                hobbies          TEXT NOT NULL,
+                photo_id         TEXT NOT NULL,           -- главное фото (обложка)
+                created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
             -- Все фото пользователя (1..5 штук) с порядком
@@ -80,13 +82,41 @@ async def init_db():
             CREATE INDEX IF NOT EXISTS idx_reports_time
                 ON reports (reported_at DESC);
         """)
+
+        # ---- МИГРАЦИЯ для уже существующих баз ----
+        # Если у пользователя база была создана до появления полей
+        # partner_age_min / partner_age_max — добавляем их с разумными значениями.
+        cur = await conn.execute("PRAGMA table_info(users)")
+        existing_cols = {row[1] for row in await cur.fetchall()}
+
+        if "partner_age_min" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN partner_age_min INTEGER NOT NULL DEFAULT 18"
+            )
+            # для уже зарегистрированных: ±10 лет от собственного возраста
+            await conn.execute("""
+                UPDATE users SET partner_age_min = MAX(18, age - 10)
+                WHERE partner_age_min = 18
+            """)
+
+        if "partner_age_max" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN partner_age_max INTEGER NOT NULL DEFAULT 99"
+            )
+            await conn.execute("""
+                UPDATE users SET partner_age_max = MIN(99, age + 10)
+                WHERE partner_age_max = 99
+            """)
+
         await conn.commit()
 
 
 async def save_user(*, user_id, username, name, age, gender, looking_for,
+                    partner_age_min, partner_age_max,
                     city, church, marital, children, hobbies, photos):
     """Сохраняем пользователя и его фотографии.
-    photos — список photo_id (1..5 штук). Первый = обложка."""
+    photos — список photo_id (1..5 штук). Первый = обложка.
+    partner_age_min/max — личный фильтр: каких людей смотрящему показывать."""
     if gender not in ("M", "F"):
         raise ValueError("gender должен быть 'M' или 'F'")
     expected_lf = "F" if gender == "M" else "M"
@@ -97,19 +127,24 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
         )
     if not photos:
         raise ValueError("Нужно хотя бы одно фото")
+    if not (18 <= partner_age_min <= partner_age_max <= 99):
+        raise ValueError("Некорректный диапазон возраста партнёра")
     photo_id = photos[0]  # обложка
 
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("""
             INSERT INTO users (user_id, username, name, age, gender, looking_for,
+                               partner_age_min, partner_age_max,
                                city, church, marital, children, hobbies, photo_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 name=excluded.name,
                 age=excluded.age,
                 gender=excluded.gender,
                 looking_for=excluded.looking_for,
+                partner_age_min=excluded.partner_age_min,
+                partner_age_max=excluded.partner_age_max,
                 city=excluded.city,
                 church=excluded.church,
                 marital=excluded.marital,
@@ -117,6 +152,7 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
                 hobbies=excluded.hobbies,
                 photo_id=excluded.photo_id
         """, (user_id, username, name, age, gender, looking_for,
+              partner_age_min, partner_age_max,
               city, church, marital, children, hobbies, photo_id))
 
         # Перезаписываем список фото — старые удаляем, новые вставляем
@@ -157,20 +193,35 @@ async def get_user(user_id: int):
 
 async def get_next_profile(user_id: int):
     """Возвращает следующую подходящую анкету.
-    Логика: показываем только анкеты противоположного пола, у которых
-    looking_for совпадает с моим полом, и которые я ещё не свайпал."""
+
+    Логика подбора:
+      - противоположный пол
+      - попадает в МОЙ диапазон возраста (partner_age_min..partner_age_max)
+        — ЭТО ОДНОСТОРОННИЙ фильтр: только мой выбор. Каждый сам решает,
+        кого видеть, поэтому НЕ требуем, чтобы я попадал в их диапазон.
+      - я ещё не свайпал
+      - не забанен
+    """
     me = await get_user(user_id)
     if not me:
         return None
 
+    # На случай старой базы / пропавших значений — берём широкий диапазон
+    my_min = me.get("partner_age_min") or 18
+    my_max = me.get("partner_age_max") or 99
+
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
 
-        # Ищем анкеты:
-        #   - не моя
-        #   - пол = тот, кого я ищу (looking_for)
-        #   - этот человек ищет мой пол
-        #   - я ещё не нажимал на эту анкету
+        # Логика подбора:
+        #   - анкета не моя
+        #   - противоположный пол (двусторонний фильтр по полу)
+        #   - я ещё не свайпал
+        #   - не забанен
+        #   - И ОДНО ИЗ:
+        #       а) попадает в МОЙ диапазон возраста
+        #       б) этот человек уже меня лайкнул — тогда показать,
+        #          даже если он вне моего диапазона
         sql = """
             SELECT u.* FROM users u
             WHERE u.user_id != ?
@@ -180,10 +231,20 @@ async def get_next_profile(user_id: int):
                   SELECT to_user FROM swipes WHERE from_user = ?
               )
               AND u.user_id NOT IN (SELECT user_id FROM banned)
+              AND (
+                  u.age BETWEEN ? AND ?
+                  OR EXISTS (
+                      SELECT 1 FROM swipes likes_me
+                      WHERE likes_me.from_user = u.user_id
+                        AND likes_me.to_user = ?
+                        AND likes_me.action = 'like'
+                  )
+              )
             ORDER BY RANDOM()
             LIMIT 1
         """
-        args = (user_id, me["looking_for"], me["gender"], user_id)
+        args = (user_id, me["looking_for"], me["gender"], user_id,
+                my_min, my_max, user_id)
 
         cur = await conn.execute(sql, args)
         row = await cur.fetchone()
@@ -396,3 +457,194 @@ async def get_recent_reports(limit: int = 20):
         """, (limit,))
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
+
+
+# ============= СТАТИСТИКА =============
+
+async def get_stats() -> dict:
+    """Собираем сводную статистику для админа.
+    Возвращаем dict со всеми ключевыми метриками."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        async def _one(sql: str, params: tuple = ()) -> int:
+            cur = await conn.execute(sql, params)
+            row = await cur.fetchone()
+            return row[0] if row and row[0] is not None else 0
+
+        async def _list(sql: str, params: tuple = ()):
+            cur = await conn.execute(sql, params)
+            return await cur.fetchall()
+
+        stats: dict = {}
+
+        # ---- ПОЛЬЗОВАТЕЛИ ----
+        stats["users_total"] = await _one("SELECT COUNT(*) FROM users")
+        stats["users_male"] = await _one(
+            "SELECT COUNT(*) FROM users WHERE gender = 'M'"
+        )
+        stats["users_female"] = await _one(
+            "SELECT COUNT(*) FROM users WHERE gender = 'F'"
+        )
+        stats["users_24h"] = await _one(
+            "SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-1 day')"
+        )
+        stats["users_7d"] = await _one(
+            "SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 day')"
+        )
+        stats["users_30d"] = await _one(
+            "SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-30 day')"
+        )
+        stats["users_active_7d"] = await _one("""
+            SELECT COUNT(DISTINCT from_user) FROM swipes
+            WHERE created_at >= datetime('now', '-7 day')
+        """)
+
+        # ---- СВАЙПЫ ----
+        stats["swipes_total"] = await _one("SELECT COUNT(*) FROM swipes")
+        stats["likes_total"] = await _one(
+            "SELECT COUNT(*) FROM swipes WHERE action = 'like'"
+        )
+        stats["dislikes_total"] = await _one(
+            "SELECT COUNT(*) FROM swipes WHERE action = 'dislike'"
+        )
+        stats["swipes_24h"] = await _one(
+            "SELECT COUNT(*) FROM swipes WHERE created_at >= datetime('now', '-1 day')"
+        )
+        if stats["swipes_total"] > 0:
+            stats["like_rate"] = round(
+                100 * stats["likes_total"] / stats["swipes_total"], 1
+            )
+        else:
+            stats["like_rate"] = 0.0
+
+        # ---- МАТЧИ ----
+        # Делим на 2, потому что каждая пара считается дважды (a->b и b->a)
+        stats["matches_total"] = await _one("""
+            SELECT COUNT(*) / 2 FROM swipes s1
+            WHERE s1.action = 'like'
+              AND EXISTS (
+                  SELECT 1 FROM swipes s2
+                  WHERE s2.from_user = s1.to_user
+                    AND s2.to_user = s1.from_user
+                    AND s2.action = 'like'
+              )
+        """)
+        # Новые матчи: считаем по более позднему лайку в паре
+        stats["matches_24h"] = await _one("""
+            SELECT COUNT(*) FROM swipes s1
+            WHERE s1.action = 'like'
+              AND s1.created_at >= datetime('now', '-1 day')
+              AND EXISTS (
+                  SELECT 1 FROM swipes s2
+                  WHERE s2.from_user = s1.to_user
+                    AND s2.to_user = s1.from_user
+                    AND s2.action = 'like'
+                    AND s2.created_at <= s1.created_at
+              )
+        """)
+        stats["matches_7d"] = await _one("""
+            SELECT COUNT(*) FROM swipes s1
+            WHERE s1.action = 'like'
+              AND s1.created_at >= datetime('now', '-7 day')
+              AND EXISTS (
+                  SELECT 1 FROM swipes s2
+                  WHERE s2.from_user = s1.to_user
+                    AND s2.to_user = s1.from_user
+                    AND s2.action = 'like'
+                    AND s2.created_at <= s1.created_at
+              )
+        """)
+
+        # ---- ТОП ГОРОДОВ И ЦЕРКВЕЙ ----
+        rows = await _list("""
+            SELECT city, COUNT(*) as cnt FROM users
+            GROUP BY LOWER(TRIM(city))
+            ORDER BY cnt DESC LIMIT 5
+        """)
+        stats["top_cities"] = [(r[0], r[1]) for r in rows]
+
+        rows = await _list("""
+            SELECT church, COUNT(*) as cnt FROM users
+            GROUP BY LOWER(TRIM(church))
+            ORDER BY cnt DESC LIMIT 5
+        """)
+        stats["top_churches"] = [(r[0], r[1]) for r in rows]
+
+        # ---- МОДЕРАЦИЯ ----
+        stats["reports_total"] = await _one("SELECT COUNT(*) FROM reports")
+        stats["reports_24h"] = await _one(
+            "SELECT COUNT(*) FROM reports WHERE reported_at >= datetime('now', '-1 day')"
+        )
+        stats["banned_total"] = await _one("SELECT COUNT(*) FROM banned")
+
+        return stats
+
+
+async def get_user_info(user_id: int) -> dict:
+    """Полная информация о пользователе для админа:
+    анкета + активность (свайпы, жалобы, матчи, статус бана)."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+
+        async def _one(sql: str, params: tuple = ()) -> int:
+            cur = await conn.execute(sql, params)
+            row = await cur.fetchone()
+            return row[0] if row and row[0] is not None else 0
+
+        info: dict = {"user_id": user_id}
+
+        # Анкета
+        cur = await conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        u = await cur.fetchone()
+        info["profile"] = dict(u) if u else None
+
+        # Статус бана
+        cur = await conn.execute("SELECT * FROM banned WHERE user_id = ?", (user_id,))
+        ban = await cur.fetchone()
+        info["ban"] = dict(ban) if ban else None
+
+        # Активность пользователя (что ОН делал)
+        info["my_likes"] = await _one(
+            "SELECT COUNT(*) FROM swipes WHERE from_user = ? AND action = 'like'",
+            (user_id,)
+        )
+        info["my_dislikes"] = await _one(
+            "SELECT COUNT(*) FROM swipes WHERE from_user = ? AND action = 'dislike'",
+            (user_id,)
+        )
+        info["my_reports"] = await _one(
+            "SELECT COUNT(*) FROM reports WHERE reporter_id = ?", (user_id,)
+        )
+
+        # Что получил ОТ других
+        info["likes_received"] = await _one(
+            "SELECT COUNT(*) FROM swipes WHERE to_user = ? AND action = 'like'",
+            (user_id,)
+        )
+        info["dislikes_received"] = await _one(
+            "SELECT COUNT(*) FROM swipes WHERE to_user = ? AND action = 'dislike'",
+            (user_id,)
+        )
+        info["reports_against"] = await _one(
+            "SELECT COUNT(*) FROM reports WHERE target_id = ?", (user_id,)
+        )
+
+        # Матчи (взаимные лайки)
+        info["matches"] = await _one("""
+            SELECT COUNT(*) FROM swipes s1
+            WHERE s1.from_user = ? AND s1.action = 'like'
+              AND EXISTS (
+                  SELECT 1 FROM swipes s2
+                  WHERE s2.from_user = s1.to_user
+                    AND s2.to_user = s1.from_user
+                    AND s2.action = 'like'
+              )
+        """, (user_id,))
+
+        # Последняя активность
+        cur = await conn.execute(
+            "SELECT MAX(created_at) FROM swipes WHERE from_user = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        info["last_active"] = row[0] if row else None
+
+        return info
