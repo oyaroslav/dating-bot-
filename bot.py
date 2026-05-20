@@ -69,6 +69,104 @@ else:
     logging.info("REQUIRED_CHANNELS не задан — проверка подписки выключена.")
 
 
+# ----------- Согласие на обработку ПДн (152-ФЗ) -----------
+# Тексты политики и соглашения хранятся в файлах рядом с ботом.
+# Они отдаются прямо в чат — без переходов на внешние сайты.
+def _load_doc(filename: str, fallback: str) -> str:
+    """Грузим текст документа из файла. Если файла нет — fallback."""
+    path = os.path.join(os.path.dirname(__file__), filename)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        logging.warning(f"Файл {filename} не найден, использую заглушку.")
+        return fallback
+
+
+PRIVACY_POLICY_TEXT = _load_doc(
+    "PRIVACY_POLICY.md",
+    "Текст политики не настроен. Свяжись с администратором."
+)
+USER_AGREEMENT_TEXT = _load_doc(
+    "USER_AGREEMENT.md",
+    "Текст соглашения не настроен. Свяжись с администратором."
+)
+# При смене версии все согласия обнулятся — пользователи примут заново.
+CONSENT_VERSION = "v1"
+
+# Telegram ограничивает длину сообщения 4096 символами.
+# Если документ длиннее — режем на части и шлём подряд.
+TG_MSG_LIMIT = 4000  # с запасом на форматирование
+
+
+def split_for_telegram(text: str, limit: int = TG_MSG_LIMIT) -> list[str]:
+    """Делит длинный текст на куски по строкам, не разрывая абзацы."""
+    if len(text) <= limit:
+        return [text]
+    parts, buf = [], []
+    cur_len = 0
+    for line in text.split("\n"):
+        # +1 за \n
+        if cur_len + len(line) + 1 > limit and buf:
+            parts.append("\n".join(buf))
+            buf, cur_len = [], 0
+        buf.append(line)
+        cur_len += len(line) + 1
+    if buf:
+        parts.append("\n".join(buf))
+    return parts
+
+
+async def send_long_document(chat_id: int, text: str):
+    """Отправляет длинный документ в чат, разбив на части если нужно."""
+    for part in split_for_telegram(text):
+        try:
+            await bot.send_message(chat_id, part, disable_web_page_preview=True)
+        except Exception as e:
+            logging.warning(f"Не смог отправить часть документа: {e}")
+
+
+def consent_kb() -> InlineKeyboardMarkup:
+    """Клавиатура: показать политику, показать соглашение, принять, отказаться."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Читать политику обработки ПДн",
+                              callback_data="consent:show_privacy")],
+        [InlineKeyboardButton(text="📜 Читать пользовательское соглашение",
+                              callback_data="consent:show_agreement")],
+        [InlineKeyboardButton(text="✅ Принимаю",
+                              callback_data="consent:accept")],
+        [InlineKeyboardButton(text="❌ Отказываюсь",
+                              callback_data="consent:decline")],
+    ])
+
+
+async def require_consent(message_or_call) -> bool:
+    """Проверяет, есть ли у пользователя согласие. Если нет — показывает
+    запрос с кнопками и возвращает False. Если есть — True."""
+    user_id = message_or_call.from_user.id
+    if await db.has_consent(user_id):
+        return True
+
+    text = (
+        "📋 <b>Согласие на обработку персональных данных</b>\n\n"
+        "Для пользования ботом необходимо согласие на обработку "
+        "персональных данных в соответствии с Федеральным законом "
+        "№ 152-ФЗ «О персональных данных».\n\n"
+        "Бот собирает: имя, возраст, пол, город, церковь, семейное положение, "
+        "наличие детей, описание интересов, фотографии. Эти данные "
+        "показываются другим пользователям бота, чтобы вы могли знакомиться.\n\n"
+        "<b>Перед тем как принять</b> — ознакомься с документами по кнопкам ниже."
+    )
+    if isinstance(message_or_call, CallbackQuery):
+        try:
+            await message_or_call.message.answer(text, reply_markup=consent_kb())
+        except Exception:
+            pass
+    else:
+        await message_or_call.answer(text, reply_markup=consent_kb())
+    return False
+
+
 async def get_unsubscribed_channels(user_id: int) -> list[dict]:
     """Возвращает список каналов, на которые пользователь НЕ подписан.
     Каждый элемент: {chat_id, title, invite_link}.
@@ -262,7 +360,11 @@ def children_kb() -> ReplyKeyboardMarkup:
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
-    # Проверка обязательной подписки на каналы
+    # Сначала — согласие на обработку ПДн (152-ФЗ).
+    # Без него нельзя ничего показывать и тем более собирать данные.
+    if not await require_consent(message):
+        return
+    # Затем — обязательная подписка на каналы
     if not await require_subscription(message):
         return
     user = await db.get_user(message.from_user.id)
@@ -279,6 +381,87 @@ async def cmd_start(message: Message, state: FSMContext):
             reply_markup=ReplyKeyboardRemove(),
         )
         await state.set_state(Form.name)
+
+
+# ----------- Обработчики кнопок согласия -----------
+@router.callback_query(F.data == "consent:accept")
+async def on_consent_accept(call: CallbackQuery, state: FSMContext):
+    await db.grant_consent(call.from_user.id, CONSENT_VERSION)
+    await call.answer("✅ Согласие принято", show_alert=False)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    # Дальше как в /start — проверяем подписку, потом ведём в регистрацию
+    if not await require_subscription(call):
+        return
+
+    user = await db.get_user(call.from_user.id)
+    if user:
+        await bot.send_message(
+            call.from_user.id,
+            f"С возвращением, {user['name']}! Что будем делать?",
+            reply_markup=main_menu_kb(),
+        )
+    else:
+        await bot.send_message(
+            call.from_user.id,
+            "Спасибо! Теперь давай заполним анкету.\n\n"
+            "<b>Как тебя зовут?</b>",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.set_state(Form.name)
+
+
+@router.callback_query(F.data == "consent:decline")
+async def on_consent_decline(call: CallbackQuery):
+    await call.answer()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await bot.send_message(
+        call.from_user.id,
+        "Без согласия на обработку персональных данных пользоваться "
+        "ботом нельзя. Если передумаешь — напиши /start ещё раз."
+    )
+
+
+# ----------- Показ документов прямо в чате -----------
+@router.callback_query(F.data == "consent:show_privacy")
+async def on_show_privacy(call: CallbackQuery):
+    await call.answer()
+    await send_long_document(call.from_user.id, PRIVACY_POLICY_TEXT)
+    # Дублируем окно с кнопками — чтобы можно было принять/отказаться
+    # после прочтения
+    await bot.send_message(
+        call.from_user.id,
+        "👆 Это была Политика обработки ПДн.\nТеперь выбери:",
+        reply_markup=consent_kb(),
+    )
+
+
+@router.callback_query(F.data == "consent:show_agreement")
+async def on_show_agreement(call: CallbackQuery):
+    await call.answer()
+    await send_long_document(call.from_user.id, USER_AGREEMENT_TEXT)
+    await bot.send_message(
+        call.from_user.id,
+        "👆 Это было Пользовательское соглашение.\nТеперь выбери:",
+        reply_markup=consent_kb(),
+    )
+
+
+# Команды доступны всегда — можно прочитать документы и просто так
+@router.message(Command("privacy"))
+async def cmd_privacy(message: Message):
+    await send_long_document(message.from_user.id, PRIVACY_POLICY_TEXT)
+
+
+@router.message(Command("agreement"))
+async def cmd_agreement(message: Message):
+    await send_long_document(message.from_user.id, USER_AGREEMENT_TEXT)
 
 
 # Кнопка «Я подписался — проверить»
@@ -319,6 +502,11 @@ async def on_check_sub(call: CallbackQuery, state: FSMContext):
 @router.message(F.text == "✏️ Заполнить заново")
 async def restart_form(message: Message, state: FSMContext):
     await state.clear()
+    # Помечаем что это перезаполнение — после успешного сохранения
+    # обнулим свайпы, чтобы ленту можно было листать заново.
+    # Если пользователь бросит регистрацию на полпути — флаг исчезнет
+    # вместе со state, и старая анкета продолжит жить как ни в чём не бывало.
+    await state.update_data(is_restart=True)
     await message.answer("Хорошо, начнём заново.\n\n<b>Как тебя зовут?</b>",
                          reply_markup=ReplyKeyboardRemove())
     await state.set_state(Form.name)
@@ -545,6 +733,8 @@ async def form_photo_done(call: CallbackQuery, state: FSMContext):
         await call.answer("Нужно минимум 2 фото!", show_alert=True)
         return
     await call.answer()
+    # Запомним, было ли это перезаполнение — нужно ПЕРЕД state.clear()
+    is_restart = data.get("is_restart", False)
     await db.save_user(
         user_id=call.from_user.id,
         username=call.from_user.username,
@@ -560,12 +750,24 @@ async def form_photo_done(call: CallbackQuery, state: FSMContext):
         children=data["children"],
         hobbies=data["hobbies"],
         photos=photos,
+        platform="tg",
     )
+
+    # Если это было перезаполнение — сбрасываем личную историю,
+    # чтобы пользователь снова видел все анкеты с начала.
+    # ВАЖНО: чужие лайки в его адрес НЕ трогаем (это чужие данные).
+    # Также не трогаем баны и жалобы — иначе можно было бы уходить от модерации.
+    extra_text = ""
+    if is_restart:
+        await db.reset_user_swipes(call.from_user.id)
+        viewer_state.pop(call.from_user.id, None)  # чистим в памяти тоже
+        extra_text = "\n\nИстория свайпов сброшена — будешь видеть всех заново."
+
     await state.clear()
     await call.message.edit_reply_markup(reply_markup=None)
     await bot.send_message(
         call.from_user.id,
-        f"✅ Анкета сохранена! Загружено фото: {len(photos)}.\n\n"
+        f"✅ Анкета сохранена! Загружено фото: {len(photos)}." + extra_text + "\n\n"
         "Жми «🔍 Смотреть анкеты», чтобы начать знакомиться. "
         "Если кто-то ответит взаимностью — я пришлю тебе его контакт.",
         reply_markup=main_menu_kb(),
@@ -760,35 +962,45 @@ async def on_swipe(call: CallbackQuery):
 
 
 async def notify_match(user_a_id: int, user_b_id: int):
-    """Уведомляем обоих о взаимном лайке."""
+    """Уведомляем обоих о взаимном лайке.
+    Каждый получает уведомление через ту платформу, на которой он зарегистрирован.
+    A — тот, кто только что лайкнул (источник вызова).
+    B — кого лайкнул.
+    Эта функция Telegram-бота уведомляет ТОЛЬКО Telegram-пользователей.
+    Если в матче участвует VK-пользователь, его уведомит VK-бот через общий
+    механизм (см. notify_match_for_user в database.py).
+    """
     a = await db.get_user(user_a_id)
     b = await db.get_user(user_b_id)
     if not a or not b:
         return
 
-    def contact_link(u):
-        if u["username"]:
-            return f'<a href="https://t.me/{u["username"]}">@{u["username"]}</a>'
-        return f'<a href="tg://user?id={u["user_id"]}">написать в Telegram</a>'
-
+    # Тексты с использованием универсальной функции построения ссылки
     text_for_a = (
         f"🎉 <b>Вы понравились друг другу!</b>\n\n"
         f"<b>{b['name']}, {b['age']}</b>\n"
-        f"Контакт: {contact_link(b)}"
+        f'Контакт: <a href="{db.contact_link(b)}">'
+        f'{"@" + b["username"] if b["username"] else "написать"}</a>'
     )
     text_for_b = (
         f"🎉 <b>Вы понравились друг другу!</b>\n\n"
         f"<b>{a['name']}, {a['age']}</b>\n"
-        f"Контакт: {contact_link(a)}"
+        f'Контакт: <a href="{db.contact_link(a)}">'
+        f'{"@" + a["username"] if a["username"] else "написать"}</a>'
     )
-    try:
-        await bot.send_photo(user_a_id, b["photo_id"], caption=text_for_a)
-    except Exception as e:
-        logging.warning(f"Не смог уведомить {user_a_id}: {e}")
-    try:
-        await bot.send_photo(user_b_id, a["photo_id"], caption=text_for_b)
-    except Exception as e:
-        logging.warning(f"Не смог уведомить {user_b_id}: {e}")
+
+    # Этот бот — Telegram. Шлём только TG-пользователям.
+    # VK-пользователей уведомит VK-бот, когда мы его сделаем.
+    if db.is_tg_user(user_a_id):
+        try:
+            await bot.send_photo(user_a_id, b["photo_id"], caption=text_for_a)
+        except Exception as e:
+            logging.warning(f"Не смог уведомить TG-юзера {user_a_id}: {e}")
+    if db.is_tg_user(user_b_id):
+        try:
+            await bot.send_photo(user_b_id, a["photo_id"], caption=text_for_b)
+        except Exception as e:
+            logging.warning(f"Не смог уведомить TG-юзера {user_b_id}: {e}")
 
 
 # ----------- Моя анкета -----------
@@ -865,6 +1077,54 @@ async def notify_admins_about_report(reporter_id: int, target_id: int, total: in
             await bot.send_message(admin_id, text)
         except Exception as e:
             logging.warning(f"Не смог уведомить админа {admin_id}: {e}")
+
+
+# ----------- Команды для пользователя (право на удаление по 152-ФЗ) -----------
+@router.message(Command("forget"))
+async def cmd_forget(message: Message, state: FSMContext):
+    """Право пользователя на удаление своих данных по 152-ФЗ, ст. 14.
+    Удаляем всё, что связано с пользователем."""
+    await state.clear()
+    user_id = message.from_user.id
+
+    # Двойное подтверждение через кнопки, чтобы не удалить случайно
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отмена", callback_data="forget:cancel"),
+        InlineKeyboardButton(text="🗑 Да, удалить", callback_data="forget:confirm"),
+    ]])
+    await message.answer(
+        "🗑 <b>Удаление всех данных</b>\n\n"
+        "Будут удалены: анкета, фотографии, все лайки и матчи, согласие. "
+        "Это <b>необратимо</b>.\n\n"
+        "Если кто-то лайкнул тебя — они тоже узнают, что ты ушёл (твоя анкета "
+        "просто исчезнет из их матчей).\n\n"
+        "Точно удалить?",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "forget:cancel")
+async def on_forget_cancel(call: CallbackQuery):
+    await call.answer("Отменено")
+    try:
+        await call.message.edit_text("Отмена. Данные сохранены.")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "forget:confirm")
+async def on_forget_confirm(call: CallbackQuery):
+    user_id = call.from_user.id
+    await db.delete_user_completely(user_id)
+    viewer_state.pop(user_id, None)
+    await call.answer("Данные удалены", show_alert=True)
+    try:
+        await call.message.edit_text(
+            "🗑 Все твои данные удалены.\n\n"
+            "Если когда-нибудь захочешь вернуться — напиши /start."
+        )
+    except Exception:
+        pass
 
 
 # ----------- Админ-команды -----------

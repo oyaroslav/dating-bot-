@@ -28,6 +28,7 @@ async def init_db():
                 children         TEXT NOT NULL,
                 hobbies          TEXT NOT NULL,
                 photo_id         TEXT NOT NULL,           -- главное фото (обложка)
+                platform         TEXT NOT NULL DEFAULT 'tg',  -- 'tg' / 'vk'
                 created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -81,6 +82,15 @@ async def init_db():
                 ON reports (target_id);
             CREATE INDEX IF NOT EXISTS idx_reports_time
                 ON reports (reported_at DESC);
+
+            -- Согласие на обработку персональных данных (152-ФЗ).
+            -- Храним сам факт и время — это нужно для подтверждения, что
+            -- пользователь видел политику и согласился на обработку.
+            CREATE TABLE IF NOT EXISTS consents (
+                user_id     INTEGER PRIMARY KEY,
+                accepted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                version     TEXT NOT NULL DEFAULT 'v1'
+            );
         """)
 
         # ---- МИГРАЦИЯ для уже существующих баз ----
@@ -108,15 +118,26 @@ async def init_db():
                 WHERE partner_age_max = 99
             """)
 
+        # Платформа: 'tg' для Telegram, 'vk' для ВКонтакте.
+        # Существующие пользователи — Telegram (мы только начали делать ВК).
+        if "platform" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN platform TEXT NOT NULL DEFAULT 'tg'"
+            )
+
         await conn.commit()
 
 
 async def save_user(*, user_id, username, name, age, gender, looking_for,
                     partner_age_min, partner_age_max,
-                    city, church, marital, children, hobbies, photos):
+                    city, church, marital, children, hobbies, photos,
+                    platform="tg"):
     """Сохраняем пользователя и его фотографии.
     photos — список photo_id (1..5 штук). Первый = обложка.
-    partner_age_min/max — личный фильтр: каких людей смотрящему показывать."""
+    partner_age_min/max — личный фильтр: каких людей смотрящему показывать.
+    platform — 'tg' (Telegram) или 'vk' (ВКонтакте).
+      Для VK user_id хранится как отрицательное число (например, -789012),
+      чтобы не конфликтовать с Telegram-id."""
     if gender not in ("M", "F"):
         raise ValueError("gender должен быть 'M' или 'F'")
     expected_lf = "F" if gender == "M" else "M"
@@ -129,14 +150,17 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
         raise ValueError("Нужно хотя бы одно фото")
     if not (18 <= partner_age_min <= partner_age_max <= 99):
         raise ValueError("Некорректный диапазон возраста партнёра")
+    if platform not in ("tg", "vk"):
+        raise ValueError(f"platform должен быть 'tg' или 'vk', получено: {platform}")
     photo_id = photos[0]  # обложка
 
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("""
             INSERT INTO users (user_id, username, name, age, gender, looking_for,
                                partner_age_min, partner_age_max,
-                               city, church, marital, children, hobbies, photo_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               city, church, marital, children, hobbies, photo_id,
+                               platform)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 name=excluded.name,
@@ -150,10 +174,11 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
                 marital=excluded.marital,
                 children=excluded.children,
                 hobbies=excluded.hobbies,
-                photo_id=excluded.photo_id
+                photo_id=excluded.photo_id,
+                platform=excluded.platform
         """, (user_id, username, name, age, gender, looking_for,
               partner_age_min, partner_age_max,
-              city, church, marital, children, hobbies, photo_id))
+              city, church, marital, children, hobbies, photo_id, platform))
 
         # Перезаписываем список фото — старые удаляем, новые вставляем
         await conn.execute("DELETE FROM user_photos WHERE user_id = ?", (user_id,))
@@ -648,3 +673,132 @@ async def get_user_info(user_id: int) -> dict:
         info["last_active"] = row[0] if row else None
 
         return info
+
+
+async def reset_user_swipes(user_id: int):
+    """Сбросить ЛИЧНУЮ историю взаимодействий пользователя.
+    Удаляем:
+      - его свайпы (лайки/дизлайки от него) — чтобы ленту начать сначала
+      - его историю просмотров (для стрелки «◀»)
+      - запись о последней показанной анкете
+
+    НЕ трогаем:
+      - чужие свайпы В ЕГО адрес (это чужие данные)
+      - его матчи (если у него уже были взаимные лайки, и обе стороны
+        стояли — после сброса односторонняя «нить» с его стороны порвётся,
+        но это нормально: при следующей встрече он сможет лайкнуть заново)
+      - бан, жалобы на него или от него (модерация неприкосновенна)
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM swipes WHERE from_user = ?", (user_id,))
+        await conn.execute("DELETE FROM view_history WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM shown WHERE user_id = ?", (user_id,))
+        await conn.commit()
+
+
+# ============= СОГЛАСИЕ НА ОБРАБОТКУ ПДн (152-ФЗ) =============
+
+async def has_consent(user_id: int) -> bool:
+    """Принял ли пользователь согласие на обработку персональных данных."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT 1 FROM consents WHERE user_id = ?", (user_id,)
+        )
+        return await cur.fetchone() is not None
+
+
+async def grant_consent(user_id: int, version: str = "v1"):
+    """Записываем факт согласия. Важно для подтверждения, что у нас
+    есть основание обрабатывать данные пользователя по 152-ФЗ."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("""
+            INSERT INTO consents (user_id, version) VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                accepted_at = CURRENT_TIMESTAMP,
+                version = excluded.version
+        """, (user_id, version))
+        await conn.commit()
+
+
+async def revoke_consent(user_id: int):
+    """Отозвать согласие. Используется при /forget или если
+    пользователь явно отказывается от обработки данных."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM consents WHERE user_id = ?", (user_id,))
+        await conn.commit()
+
+
+async def delete_user_completely(user_id: int):
+    """Полное удаление пользователя по запросу (право на забвение, 152-ФЗ ст.14).
+    Чистим:
+      - анкету (users)
+      - фотографии (user_photos)
+      - все его свайпы (от него и к нему)
+      - историю просмотров
+      - shown
+      - жалобы (от него и на него)
+      - бан (если был)
+      - согласие
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM user_photos WHERE user_id = ?", (user_id,))
+        await conn.execute(
+            "DELETE FROM swipes WHERE from_user = ? OR to_user = ?",
+            (user_id, user_id),
+        )
+        await conn.execute("DELETE FROM view_history WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM shown WHERE user_id = ?", (user_id,))
+        await conn.execute(
+            "DELETE FROM reports WHERE reporter_id = ? OR target_id = ?",
+            (user_id, user_id),
+        )
+        await conn.execute("DELETE FROM banned WHERE user_id = ?", (user_id,))
+        await conn.execute("DELETE FROM consents WHERE user_id = ?", (user_id,))
+        await conn.commit()
+
+
+# ============= МУЛЬТИПЛАТФОРМЕННОСТЬ =============
+
+def vk_id_to_db_id(vk_user_id: int) -> int:
+    """Преобразует VK user_id (положительное число) в наш db_id (отрицательное).
+    Так VK-пользователи не конфликтуют с Telegram в общей таблице."""
+    if vk_user_id <= 0:
+        raise ValueError(f"VK user_id должен быть > 0, получено: {vk_user_id}")
+    return -vk_user_id
+
+
+def db_id_to_vk_id(db_user_id: int) -> int:
+    """Обратное преобразование."""
+    if db_user_id >= 0:
+        raise ValueError(f"db_user_id для VK должен быть < 0, получено: {db_user_id}")
+    return -db_user_id
+
+
+def is_vk_user(db_user_id: int) -> bool:
+    """Проверяет, что пользователь из VK (по знаку id)."""
+    return db_user_id < 0
+
+
+def is_tg_user(db_user_id: int) -> bool:
+    """Проверяет, что пользователь из Telegram."""
+    return db_user_id > 0
+
+
+def contact_link(user_row: dict) -> str:
+    """Формирует ссылку для связи в зависимости от платформы.
+    user_row — запись из таблицы users (содержит platform и username/user_id)."""
+    platform = user_row.get("platform", "tg")
+    username = user_row.get("username")
+    user_id = user_row["user_id"]
+
+    if platform == "vk":
+        vk_id = db_id_to_vk_id(user_id) if user_id < 0 else user_id
+        # username в VK — это короткое имя страницы (screen_name), если есть
+        if username:
+            return f"https://vk.com/{username}"
+        return f"https://vk.com/id{vk_id}"
+    else:  # tg
+        if username:
+            return f"https://t.me/{username}"
+        return f"tg://user?id={user_id}"
