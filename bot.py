@@ -1038,20 +1038,27 @@ async def notify_match(user_a_id: int, user_b_id: int):
         f'{"@" + a["username"] if a["username"] else "написать"}</a>'
     )
 
-    # Этот бот — Telegram. Шлём только TG-пользователям.
-    # VK-пользователей уведомит VK-бот, когда мы его сделаем.
+    # Telegram-бот: VK-пользователей не можем напрямую уведомить через VK API,
+    # поэтому кладём в очередь — VK-бот сам разошлёт.
     a_photo = photo_source(a.get("photo_path"), a["photo_id"])
     b_photo = photo_source(b.get("photo_path"), b["photo_id"])
+
     if db.is_tg_user(user_a_id):
         try:
             await bot.send_photo(user_a_id, b_photo, caption=text_for_a)
         except Exception as e:
             logging.warning(f"Не смог уведомить TG-юзера {user_a_id}: {e}")
+    else:
+        # VK-юзер — в очередь, чтобы VK-бот доставил
+        await db.queue_match_notification(user_a_id, user_b_id)
+
     if db.is_tg_user(user_b_id):
         try:
             await bot.send_photo(user_b_id, a_photo, caption=text_for_b)
         except Exception as e:
             logging.warning(f"Не смог уведомить TG-юзера {user_b_id}: {e}")
+    else:
+        await db.queue_match_notification(user_b_id, user_a_id)
 
 
 # ----------- Моя анкета -----------
@@ -1524,12 +1531,67 @@ async def cmd_migrate_photos(message: Message):
         await message.answer(f"❌ Ошибка миграции: <code>{e}</code>")
 
 
+# ----------- Фоновая задача: доставка кросс-платформенных уведомлений -----------
+async def deliver_pending_notifications():
+    """Раз в 3 секунды смотрим в очередь pending_notifications.
+    TG-бот доставляет:
+      - match для TG-получателей (VK-получателей возьмёт VK-бот)
+      - admin_report (админы всегда в Telegram)"""
+    while True:
+        try:
+            notifications = await db.get_pending_notifications()
+            for n in notifications:
+                try:
+                    if n["kind"] == "match":
+                        recipient = n["recipient_id"]
+                        if recipient is None or not db.is_tg_user(recipient):
+                            # Это для VK-юзера — пропускаем, доставит VK-бот
+                            continue
+                        partner_id = n["partner_id"]
+                        partner = await db.get_user(partner_id)
+                        if partner:
+                            text = (
+                                f"🎉 <b>Вы понравились друг другу!</b>\n\n"
+                                f"<b>{partner['name']}, {partner['age']}</b>\n"
+                                f'Контакт: <a href="{db.contact_link(partner)}">'
+                                f'{partner.get("name") or "написать"}</a>'
+                            )
+                            src = photo_source(partner.get("photo_path"),
+                                                partner["photo_id"])
+                            try:
+                                await bot.send_photo(recipient, src, caption=text)
+                            except Exception as e:
+                                logging.warning(f"send_photo failed: {e}")
+                                try:
+                                    await bot.send_message(recipient, text)
+                                except Exception:
+                                    pass
+                        await db.mark_notification_delivered(n["id"])
+
+                    elif n["kind"] == "admin_report":
+                        import json
+                        payload = json.loads(n["payload"] or "{}")
+                        reporter_id = payload.get("reporter_id")
+                        target_id = payload.get("target_id")
+                        total = payload.get("total", 0)
+                        await notify_admins_about_report(reporter_id, target_id, total)
+                        await db.mark_notification_delivered(n["id"])
+                except Exception as e:
+                    logging.exception(f"Доставка уведомления {n['id']} упала: {e}")
+                    await db.mark_notification_delivered(n["id"])
+        except Exception as e:
+            logging.exception(f"deliver_pending_notifications loop error: {e}")
+        await asyncio.sleep(3)
+
+
 # ----------- Запуск -----------
 async def main():
     await db.init_db()
     db.ensure_photos_dir()
     logging.info("База данных готова. Запускаем бота…")
     await bot.delete_webhook(drop_pending_updates=True)
+    # Фоновая задача доставки кросс-платформенных уведомлений
+    asyncio.create_task(deliver_pending_notifications())
     await dp.start_polling(bot)
 
 

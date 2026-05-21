@@ -93,6 +93,21 @@ async def init_db():
                 accepted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 version     TEXT NOT NULL DEFAULT 'v1'
             );
+
+            -- Очередь уведомлений для кросс-платформенной доставки.
+            -- VK-бот не может слать в Telegram напрямую, поэтому кладёт сюда.
+            -- TG-бот раз в несколько секунд читает и доставляет.
+            CREATE TABLE IF NOT EXISTS pending_notifications (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind         TEXT NOT NULL,
+                recipient_id INTEGER,
+                partner_id   INTEGER,
+                payload      TEXT,
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_undelivered
+                ON pending_notifications (delivered, kind);
         """)
 
         # ---- МИГРАЦИЯ для уже существующих баз ----
@@ -895,3 +910,85 @@ async def get_user_photos_with_paths(user_id: int):
         if r and r[0]:
             return [{"photo_id": r[0], "file_path": r[1]}]
         return []
+
+
+# ============= КРОСС-ПЛАТФОРМЕННЫЕ УВЕДОМЛЕНИЯ =============
+
+# Очередь уведомлений, которые должны быть доставлены через другой бот.
+# Например, VK-юзер лайкнул TG-юзера → матч. VK-бот не может отправить
+# в Telegram напрямую, поэтому кладёт запись сюда. TG-бот раз в несколько
+# секунд читает очередь и доставляет.
+# Аналогично для уведомлений админам о жалобах от VK-юзеров.
+
+async def _ensure_notifications_table():
+    """Создаёт таблицу очереди уведомлений (вызывается из init_db и при первом использовании)."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.executescript("""
+            CREATE TABLE IF NOT EXISTS pending_notifications (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind         TEXT NOT NULL,       -- 'match' | 'admin_report'
+                recipient_id INTEGER,             -- кому доставить (для match)
+                partner_id   INTEGER,             -- для match — id матча
+                payload      TEXT,                -- JSON с доп.данными (для admin_report)
+                created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                delivered    INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_pending_undelivered
+                ON pending_notifications (delivered, kind);
+        """)
+        await conn.commit()
+
+
+async def queue_match_notification(recipient_id: int, partner_id: int):
+    """Уведомление о матче для TG-юзера, инициированное из VK-бота."""
+    await _ensure_notifications_table()
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "INSERT INTO pending_notifications (kind, recipient_id, partner_id) "
+            "VALUES ('match', ?, ?)",
+            (recipient_id, partner_id),
+        )
+        await conn.commit()
+
+
+async def queue_admin_report(reporter_id: int, target_id: int, total: int):
+    """Жалоба от VK-юзера на кого-то — нужно уведомить TG-админов."""
+    import json
+    await _ensure_notifications_table()
+    payload = json.dumps({
+        "reporter_id": reporter_id,
+        "target_id": target_id,
+        "total": total,
+    })
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "INSERT INTO pending_notifications (kind, payload) VALUES ('admin_report', ?)",
+            (payload,),
+        )
+        await conn.commit()
+
+
+async def get_pending_notifications(kinds: tuple = ("match", "admin_report"),
+                                    limit: int = 100):
+    """Возвращает недоставленные уведомления. TG-бот будет вызывать эту
+    функцию из фоновой задачи."""
+    placeholders = ",".join("?" for _ in kinds)
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            f"SELECT * FROM pending_notifications "
+            f"WHERE delivered = 0 AND kind IN ({placeholders}) "
+            f"ORDER BY id LIMIT ?",
+            (*kinds, limit),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def mark_notification_delivered(notification_id: int):
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE pending_notifications SET delivered = 1 WHERE id = ?",
+            (notification_id,),
+        )
+        await conn.commit()
