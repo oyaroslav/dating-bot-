@@ -150,11 +150,11 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
                     city, church, marital, children, hobbies, photos,
                     platform="tg"):
     """Сохраняем пользователя и его фотографии.
-    photos — список photo_id (1..5 штук). Первый = обложка.
-    partner_age_min/max — личный фильтр: каких людей смотрящему показывать.
-    platform — 'tg' (Telegram) или 'vk' (ВКонтакте).
-      Для VK user_id хранится как отрицательное число (например, -789012),
-      чтобы не конфликтовать с Telegram-id."""
+    photos — список фотографий. Каждый элемент может быть:
+      - строкой (старый формат, photo_id) — тогда file_path = None
+      - словарём {photo_id, file_path}
+    Первый элемент = обложка.
+    """
     if gender not in ("M", "F"):
         raise ValueError("gender должен быть 'M' или 'F'")
     expected_lf = "F" if gender == "M" else "M"
@@ -169,15 +169,29 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
         raise ValueError("Некорректный диапазон возраста партнёра")
     if platform not in ("tg", "vk"):
         raise ValueError(f"platform должен быть 'tg' или 'vk', получено: {platform}")
-    photo_id = photos[0]  # обложка
+
+    # Нормализуем формат photos в список словарей
+    normalized = []
+    for p in photos[:5]:
+        if isinstance(p, str):
+            normalized.append({"photo_id": p, "file_path": None})
+        elif isinstance(p, dict):
+            normalized.append({
+                "photo_id": p.get("photo_id") or "",
+                "file_path": p.get("file_path"),
+            })
+        else:
+            raise ValueError(f"Неподдерживаемый формат фото: {type(p)}")
+
+    cover = normalized[0]  # обложка
 
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("""
             INSERT INTO users (user_id, username, name, age, gender, looking_for,
                                partner_age_min, partner_age_max,
-                               city, church, marital, children, hobbies, photo_id,
-                               platform)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                               city, church, marital, children, hobbies,
+                               photo_id, photo_path, platform)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 name=excluded.name,
@@ -192,17 +206,20 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
                 children=excluded.children,
                 hobbies=excluded.hobbies,
                 photo_id=excluded.photo_id,
+                photo_path=excluded.photo_path,
                 platform=excluded.platform
         """, (user_id, username, name, age, gender, looking_for,
               partner_age_min, partner_age_max,
-              city, church, marital, children, hobbies, photo_id, platform))
+              city, church, marital, children, hobbies,
+              cover["photo_id"], cover["file_path"], platform))
 
         # Перезаписываем список фото — старые удаляем, новые вставляем
         await conn.execute("DELETE FROM user_photos WHERE user_id = ?", (user_id,))
-        for pos, pid in enumerate(photos[:5]):  # максимум 5
+        for pos, p in enumerate(normalized):
             await conn.execute(
-                "INSERT INTO user_photos (user_id, position, photo_id) VALUES (?, ?, ?)",
-                (user_id, pos, pid),
+                "INSERT INTO user_photos (user_id, position, photo_id, file_path) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, pos, p["photo_id"], p["file_path"]),
             )
         await conn.commit()
 
@@ -749,7 +766,8 @@ async def delete_user_completely(user_id: int):
     """Полное удаление пользователя по запросу (право на забвение, 152-ФЗ ст.14).
     Чистим:
       - анкету (users)
-      - фотографии (user_photos)
+      - фотографии (user_photos) — записи в БД
+      - физические файлы фото с диска
       - все его свайпы (от него и к нему)
       - историю просмотров
       - shown
@@ -757,6 +775,17 @@ async def delete_user_completely(user_id: int):
       - бан (если был)
       - согласие
     """
+    import shutil
+    # Сначала удаляем физические файлы — пока ещё знаем путь
+    photo_dir = _os.path.join(PHOTOS_DIR, str(abs(user_id)))
+    if _os.path.exists(photo_dir):
+        try:
+            shutil.rmtree(photo_dir)
+        except Exception as e:
+            # Не критично — удаление данных в БД важнее
+            import logging
+            logging.warning(f"Не смог удалить папку {photo_dir}: {e}")
+
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("DELETE FROM users WHERE user_id = ?", (user_id,))
         await conn.execute("DELETE FROM user_photos WHERE user_id = ?", (user_id,))

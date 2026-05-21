@@ -17,12 +17,14 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton,
     InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardRemove,
-    TelegramObject, InputMediaPhoto,
+    TelegramObject, InputMediaPhoto, FSInputFile,
 )
 from typing import Any, Awaitable, Callable, Dict
 from dotenv import load_dotenv
 
+import os as _os
 import database as db
+import photo_utils
 
 # ----------- Настройка -----------
 load_dotenv()
@@ -690,7 +692,24 @@ async def form_photo(message: Message, state: FSMContext):
         await message.answer("Максимум 5 фото. Жми ✅ Готово.",
                              reply_markup=photo_done_kb(len(photos)))
         return
-    photos.append(message.photo[-1].file_id)
+
+    file_id = message.photo[-1].file_id
+    user_id = message.from_user.id
+
+    # Сразу скачиваем фото на наш сервер.
+    # Это нужно для общего хранилища: VK-боту понадобится файл,
+    # чтобы показать TG-анкету.
+    folder = db.user_photos_dir(user_id)
+    pos = len(photos)
+    target_path = _os.path.join(folder, f"{pos}.jpg")
+    ok = await photo_utils.download_tg_photo(bot, file_id, target_path)
+    if not ok:
+        # Скачивание не удалось — не сломаем регистрацию, продолжим через photo_id.
+        # На показ это не повлияет (есть fallback в photo_source).
+        logging.warning(f"Не смог скачать фото {file_id} для user {user_id}")
+        target_path = None
+
+    photos.append({"photo_id": file_id, "file_path": target_path})
     await state.update_data(photos=photos)
 
     if len(photos) < 2:
@@ -711,7 +730,14 @@ async def form_photo_undo(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     photos = data.get("photos", [])
     if photos:
-        photos.pop()
+        removed = photos.pop()
+        # Удаляем файл с диска, если был скачан
+        if isinstance(removed, dict) and removed.get("file_path"):
+            try:
+                if _os.path.exists(removed["file_path"]):
+                    _os.remove(removed["file_path"])
+            except Exception as e:
+                logging.warning(f"Не смог удалить {removed['file_path']}: {e}")
         await state.update_data(photos=photos)
     if not photos:
         await call.message.edit_text("Удалил все фото. Пришли первое фото заново.")
@@ -780,6 +806,24 @@ async def form_photo_invalid(message: Message):
 
 
 # ----------- Формат анкеты для показа -----------
+def photo_source(file_path: str | None, photo_id: str):
+    """Возвращает то, что можно отправить в send_photo / InputMediaPhoto.
+
+    Приоритет: если есть локальный файл — отдаём его через FSInputFile.
+    Если файла нет или не существует — fallback на старый photo_id Telegram.
+
+    Это даёт устойчивость: даже если миграция была неполной или файл
+    случайно пропал, бот всё равно покажет фото через Telegram-кеш."""
+    if file_path and _os.path.exists(file_path) and _os.path.getsize(file_path) > 0:
+        return FSInputFile(file_path)
+    return photo_id
+
+
+def photo_source_from_dict(p: dict):
+    """Хелпер для словарей вида {photo_id, file_path}."""
+    return photo_source(p.get("file_path"), p["photo_id"])
+
+
 def format_profile(u: dict) -> str:
     return (
         f"<b>{u['name']}, {u['age']}</b>\n"
@@ -806,9 +850,11 @@ async def show_profile_to(user_id: int, chat_id: int,
     profile = await db.get_user(target_user_id)
     if not profile:
         return False
-    photos = await db.get_user_photos(target_user_id)
+    # photos — список словарей {photo_id, file_path}
+    photos = await db.get_user_photos_with_paths(target_user_id)
     if not photos:
-        photos = [profile["photo_id"]]
+        photos = [{"photo_id": profile["photo_id"],
+                   "file_path": profile.get("photo_path")}]
     photo_idx = max(0, min(photo_idx, len(photos) - 1))
 
     viewer_state[user_id] = {
@@ -821,11 +867,14 @@ async def show_profile_to(user_id: int, chat_id: int,
 
     caption = format_profile(profile)
     kb = swipe_kb(photo_idx, len(photos))
+    src = photo_source_from_dict(photos[photo_idx])
 
     if edit_message is not None:
         try:
+            # При edit_media если src — FSInputFile, Telegram перезагружает файл.
+            # Если photo_id (строка) — использует существующий кеш Telegram.
             await edit_message.edit_media(
-                media=InputMediaPhoto(media=photos[photo_idx], caption=caption,
+                media=InputMediaPhoto(media=src, caption=caption,
                                       parse_mode="HTML"),
                 reply_markup=kb,
             )
@@ -834,7 +883,7 @@ async def show_profile_to(user_id: int, chat_id: int,
             # если не получилось отредактировать (старое сообщение и т.п.) — шлём новое
             logging.warning(f"edit_media failed: {e}")
 
-    await bot.send_photo(chat_id, photo=photos[photo_idx],
+    await bot.send_photo(chat_id, photo=src,
                          caption=caption, reply_markup=kb)
     return True
 
@@ -991,14 +1040,16 @@ async def notify_match(user_a_id: int, user_b_id: int):
 
     # Этот бот — Telegram. Шлём только TG-пользователям.
     # VK-пользователей уведомит VK-бот, когда мы его сделаем.
+    a_photo = photo_source(a.get("photo_path"), a["photo_id"])
+    b_photo = photo_source(b.get("photo_path"), b["photo_id"])
     if db.is_tg_user(user_a_id):
         try:
-            await bot.send_photo(user_a_id, b["photo_id"], caption=text_for_a)
+            await bot.send_photo(user_a_id, b_photo, caption=text_for_a)
         except Exception as e:
             logging.warning(f"Не смог уведомить TG-юзера {user_a_id}: {e}")
     if db.is_tg_user(user_b_id):
         try:
-            await bot.send_photo(user_b_id, a["photo_id"], caption=text_for_b)
+            await bot.send_photo(user_b_id, a_photo, caption=text_for_b)
         except Exception as e:
             logging.warning(f"Не смог уведомить TG-юзера {user_b_id}: {e}")
 
@@ -1010,9 +1061,9 @@ async def my_profile(message: Message):
     if not u:
         await message.answer("Анкеты ещё нет. /start чтобы создать.")
         return
-    photos = await db.get_user_photos(message.from_user.id)
+    photos = await db.get_user_photos_with_paths(message.from_user.id)
     if not photos:
-        photos = [u["photo_id"]]
+        photos = [{"photo_id": u["photo_id"], "file_path": u.get("photo_path")}]
 
     # К стандартной подписи добавляем личный фильтр по возрасту партнёра
     # (его видит только сам пользователь — другим это не показывается)
@@ -1024,14 +1075,15 @@ async def my_profile(message: Message):
         caption += f"\n\n🔎 <b>Ищу возраст {partner}:</b> {age_min}–{age_max} лет"
 
     if len(photos) == 1:
-        await message.answer_photo(photos[0], caption=caption,
+        src = photo_source_from_dict(photos[0])
+        await message.answer_photo(src, caption=caption,
                                    reply_markup=main_menu_kb())
     else:
         # Медиа-группа: подпись на первом фото
-        media = [InputMediaPhoto(media=photos[0], caption=caption,
-                                 parse_mode="HTML")]
+        media = [InputMediaPhoto(media=photo_source_from_dict(photos[0]),
+                                 caption=caption, parse_mode="HTML")]
         for p in photos[1:]:
-            media.append(InputMediaPhoto(media=p))
+            media.append(InputMediaPhoto(media=photo_source_from_dict(p)))
         await message.answer_media_group(media)
         await message.answer(f"Загружено фото: {len(photos)}.",
                              reply_markup=main_menu_kb())
@@ -1310,7 +1362,10 @@ async def cmd_baninfo(message: Message):
         f"<b>О себе:</b>\n{u['hobbies']}"
     )
     try:
-        await message.answer_photo(u["photo_id"], caption=caption)
+        await message.answer_photo(
+            photo_source(u.get("photo_path"), u["photo_id"]),
+            caption=caption,
+        )
     except Exception:
         await message.answer(caption)
 
@@ -1399,7 +1454,10 @@ async def cmd_userinfo(message: Message):
     # Если есть фото — шлём с фото, иначе текстом
     if u and u.get("photo_id"):
         try:
-            await message.answer_photo(u["photo_id"], caption=body)
+            await message.answer_photo(
+                photo_source(u.get("photo_path"), u["photo_id"]),
+                caption=body,
+            )
             return
         except Exception:
             pass  # caption может быть длиннее лимита — упадём в текстовый
@@ -1469,6 +1527,7 @@ async def cmd_migrate_photos(message: Message):
 # ----------- Запуск -----------
 async def main():
     await db.init_db()
+    db.ensure_photos_dir()
     logging.info("База данных готова. Запускаем бота…")
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
