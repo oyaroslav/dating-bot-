@@ -27,7 +27,8 @@ async def init_db():
                 marital          TEXT NOT NULL,
                 children         TEXT NOT NULL,
                 hobbies          TEXT NOT NULL,
-                photo_id         TEXT NOT NULL,           -- главное фото (обложка)
+                photo_id         TEXT NOT NULL,           -- главное фото (обложка, TG file_id для старых)
+                photo_path       TEXT,                    -- локальный путь к обложке (новая система)
                 platform         TEXT NOT NULL DEFAULT 'tg',  -- 'tg' / 'vk'
                 created_at       TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -36,7 +37,8 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS user_photos (
                 user_id    INTEGER NOT NULL,
                 position   INTEGER NOT NULL,         -- 0,1,2,3,4
-                photo_id   TEXT NOT NULL,
+                photo_id   TEXT NOT NULL,            -- TG file_id (старые) или маркер
+                file_path  TEXT,                     -- локальный путь к файлу
                 PRIMARY KEY (user_id, position)
             );
 
@@ -123,6 +125,21 @@ async def init_db():
         if "platform" not in existing_cols:
             await conn.execute(
                 "ALTER TABLE users ADD COLUMN platform TEXT NOT NULL DEFAULT 'tg'"
+            )
+
+        # Локальный путь к фото-обложке (для мультиплатформенности).
+        # Если NULL — значит используется старый photo_id (TG-нативный).
+        if "photo_path" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN photo_path TEXT"
+            )
+
+        # То же для таблицы user_photos
+        cur = await conn.execute("PRAGMA table_info(user_photos)")
+        photos_cols = {row[1] for row in await cur.fetchall()}
+        if "file_path" not in photos_cols:
+            await conn.execute(
+                "ALTER TABLE user_photos ADD COLUMN file_path TEXT"
             )
 
         await conn.commit()
@@ -802,3 +819,50 @@ def contact_link(user_row: dict) -> str:
         if username:
             return f"https://t.me/{username}"
         return f"tg://user?id={user_id}"
+
+
+# ============= УНИВЕРСАЛЬНЫЙ ДОСТУП К ФОТО =============
+
+import os as _os
+
+# Папка для локального хранения фотографий
+PHOTOS_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "photos")
+
+
+def ensure_photos_dir():
+    """Создаём папку для фото, если её нет."""
+    _os.makedirs(PHOTOS_DIR, exist_ok=True)
+
+
+def user_photos_dir(db_user_id: int) -> str:
+    """Папка под фото конкретного пользователя.
+    Используем абсолютное значение id для имени папки —
+    отрицательные VK-id превращаются в положительные."""
+    folder = _os.path.join(PHOTOS_DIR, str(abs(db_user_id)))
+    _os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+async def get_user_photos_with_paths(user_id: int):
+    """Возвращает список словарей вместо просто id.
+    Каждый элемент: {photo_id, file_path}.
+    file_path может быть None — тогда придётся использовать photo_id (старая система).
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT photo_id, file_path FROM user_photos "
+            "WHERE user_id = ? ORDER BY position",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        if rows:
+            return [{"photo_id": r[0], "file_path": r[1]} for r in rows]
+        # Совместимость со старыми анкетами
+        cur = await conn.execute(
+            "SELECT photo_id, photo_path FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        r = await cur.fetchone()
+        if r and r[0]:
+            return [{"photo_id": r[0], "file_path": r[1]}]
+        return []
