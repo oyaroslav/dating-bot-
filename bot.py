@@ -1141,7 +1141,8 @@ async def cmd_admin(message: Message):
         "<code>/unban ID</code> — разбанить\n"
         "<code>/banlist</code> — список забаненных\n"
         "<code>/baninfo ID</code> — посмотреть анкету и жалобы\n"
-        "<code>/reports</code> — последние жалобы\n\n"
+        "<code>/reports</code> — последние жалобы\n"
+        "<code>/migrate_photos</code> — миграция фото на локальное хранилище (одноразово)\n\n"
         f"Твой ID: <code>{message.from_user.id}</code>"
     )
 
@@ -1422,6 +1423,47 @@ async def cmd_reports(message: Message):
         )
     lines.append("\nПодробнее: <code>/baninfo ID</code>")
     await message.answer("\n".join(lines))
+
+
+# ----------- /migrate_photos: миграция существующих фото на локальное хранилище -----------
+@router.message(Command("migrate_photos"))
+async def cmd_migrate_photos(message: Message):
+    """Скачивает все TG-фото с серверов Telegram на наш VPS.
+    Выполняется один раз при переходе на локальное хранилище.
+    Идемпотентна: повторный запуск пропускает уже скачанные файлы."""
+    if not is_admin(message.from_user.id):
+        return
+
+    import photo_utils
+    progress_msg = await message.answer("⏳ Готовлю миграцию фотографий…")
+
+    last_update = 0
+
+    async def progress(done, total):
+        nonlocal last_update
+        # обновляем сообщение не чаще раза в 5 фоток, чтобы не упереться в rate limit
+        if done == total or done - last_update >= 5:
+            last_update = done
+            try:
+                await progress_msg.edit_text(
+                    f"📥 Миграция фотографий: <b>{done}/{total}</b>"
+                )
+            except Exception:
+                pass
+
+    try:
+        stats = await photo_utils.migrate_all_tg_photos(bot, progress_callback=progress)
+        await message.answer(
+            f"✅ <b>Миграция фото завершена</b>\n\n"
+            f"Всего: {stats['total']}\n"
+            f"Скачано: {stats['success']}\n"
+            f"Пропущено (уже было): {stats['skipped']}\n"
+            f"Ошибок: {stats['failed']}\n\n"
+            f"Фотографии теперь лежат локально в <code>/root/dating_bot/photos/</code>"
+        )
+    except Exception as e:
+        logging.exception("migrate_photos failed")
+        await message.answer(f"❌ Ошибка миграции: <code>{e}</code>")
 
 
 # ----------- Запуск -----------
