@@ -128,6 +128,8 @@ def get_data(vk_user_id: int) -> dict:
 
 # ----------- Отправка сообщений -----------
 def send_message(vk_user_id: int, text: str, keyboard=None, attachment=None):
+    """Отправляет сообщение пользователю VK. Возвращает message_id (int) или None.
+    message_id нужен, чтобы потом удалить сообщение через messages.delete."""
     params = {
         "user_id": vk_user_id,
         "message": text,
@@ -141,9 +143,22 @@ def send_message(vk_user_id: int, text: str, keyboard=None, attachment=None):
     if attachment:
         params["attachment"] = attachment
     try:
-        vk.messages.send(**params)
+        # vk.messages.send возвращает int — id отправленного сообщения
+        return vk.messages.send(**params)
     except vk_api.exceptions.ApiError as e:
         log.warning(f"Не смог отправить {vk_user_id}: {e}")
+        return None
+
+
+def delete_message_silently(message_id: int):
+    """Тихо удаляет сообщение бота (delete_for_all=1 — без следа в чате).
+    Если не получилось (прошло >24ч, уже удалено, и т.п.) — просто игнорируем."""
+    if not message_id:
+        return
+    try:
+        vk.messages.delete(message_ids=message_id, delete_for_all=1)
+    except Exception as e:
+        log.debug(f"Не смог удалить сообщение {message_id}: {e}")
 
 
 def send_long(vk_user_id: int, text: str, keyboard=None):
@@ -172,9 +187,17 @@ def gender_keyboard() -> VkKeyboard:
     return kb
 
 
-def marital_keyboard() -> VkKeyboard:
+def marital_keyboard(gender: Optional[str] = None) -> VkKeyboard:
+    """Клавиатура семейного положения.
+    Для мужчин показываем «Не женат», для женщин — «Не замужем».
+    Если gender не задан — показываем общий вариант (для обратной совместимости)."""
     kb = VkKeyboard(one_time=True)
-    kb.add_button("Не женат / Не замужем")
+    if gender == "M":
+        kb.add_button("Не женат")
+    elif gender == "F":
+        kb.add_button("Не замужем")
+    else:
+        kb.add_button("Не женат / Не замужем")
     kb.add_line()
     kb.add_button("В разводе")
     kb.add_button("Вдовец / Вдова")
@@ -412,14 +435,25 @@ async def handle_form_church(vk_user_id: int, text: str):
         return
     update_data(vk_user_id, church=church)
     set_state(vk_user_id, "marital")
-    send_message(vk_user_id, "Семейное положение?", keyboard=marital_keyboard())
+    # Кнопку «Не женат / Не замужем» показываем по полу пользователя
+    gender = get_data(vk_user_id).get("gender")
+    send_message(vk_user_id, "Семейное положение?",
+                 keyboard=marital_keyboard(gender))
 
 
 async def handle_form_marital(vk_user_id: int, text: str):
-    valid = ("Не женат / Не замужем", "В разводе", "Вдовец / Вдова")
+    # Принимаем все варианты: оба гендерных + общий старый + развод/вдовство
+    valid = ("Не женат", "Не замужем", "Не женат / Не замужем",
+             "В разводе", "Вдовец / Вдова")
+    gender = get_data(vk_user_id).get("gender")
     if text not in valid:
-        send_message(vk_user_id, "Выбери из кнопок.", keyboard=marital_keyboard())
+        send_message(vk_user_id, "Выбери из кнопок.",
+                     keyboard=marital_keyboard(gender))
         return
+    # Сохраняем буквально то, что выбрал пользователь — гендерно-корректно.
+    # «Не женат / Не замужем» (если вдруг придёт) преобразуем по полу.
+    if text == "Не женат / Не замужем":
+        text = "Не замужем" if gender == "F" else "Не женат"
     update_data(vk_user_id, marital=text)
     set_state(vk_user_id, "children")
     send_message(vk_user_id, "Есть ли дети?", keyboard=children_keyboard())
@@ -918,7 +952,11 @@ def format_profile_text(u: dict) -> str:
 
 async def send_profile_to_vk(vk_user_id: int, profile: dict,
                              photos: list, photo_idx: int = 0):
-    """Отправляет одну анкету пользователю VK с фото и кнопками свайпа."""
+    """Отправляет одну анкету пользователю VK с фото и кнопками свайпа.
+    Перед отправкой удаляет предыдущее сообщение бота (если было),
+    чтобы чат не забивался — в нём всегда видна только текущая анкета.
+    Сохраняет id нового сообщения в viewer_state, чтобы удалить его при показе
+    следующей анкеты или при выходе из ленты."""
     photo_idx = max(0, min(photo_idx, len(photos) - 1))
     p = photos[photo_idx]
 
@@ -927,16 +965,26 @@ async def send_profile_to_vk(vk_user_id: int, profile: dict,
     if p.get("file_path") and os.path.exists(p["file_path"]):
         attachment = upload_photo_to_messages(p["file_path"], vk_user_id)
     if not attachment:
-        # Fallback: если файла нет (или загрузка не получилась),
-        # шлём только текст. Это редкая ситуация — обычно файл есть.
         log.warning(f"Нет файла для фото у user_id={profile['user_id']}")
 
     text = format_profile_text(profile)
-    send_message(
+
+    # Удаляем предыдущее сообщение бота с анкетой (если было) — чтобы чат
+    # оставался чистым. Работает в течение 24ч после отправки.
+    st = viewer_state.get(vk_user_id)
+    if st and st.get("last_message_id"):
+        delete_message_silently(st["last_message_id"])
+
+    msg_id = send_message(
         vk_user_id, text,
         keyboard=swipe_keyboard(photo_idx, len(photos)),
         attachment=attachment,
     )
+
+    # Запоминаем id нового сообщения в viewer_state, чтобы удалить его
+    # при показе следующей анкеты
+    if st is not None:
+        st["last_message_id"] = msg_id
 
 
 async def show_next_profile(vk_user_id: int):
@@ -949,7 +997,10 @@ async def show_next_profile(vk_user_id: int):
 
     profile = await db.get_next_profile(db_id)
     if not profile:
-        viewer_state.pop(vk_user_id, None)
+        # Анкеты закончились — удалим последнюю показанную, чтобы чат был чист
+        st = viewer_state.pop(vk_user_id, None)
+        if st and st.get("last_message_id"):
+            delete_message_silently(st["last_message_id"])
         send_message(
             vk_user_id,
             "🤷 Анкеты закончились. Загляни позже — появятся новые!",
@@ -962,10 +1013,14 @@ async def show_next_profile(vk_user_id: int):
         photos = [{"photo_id": profile["photo_id"],
                    "file_path": profile.get("photo_path")}]
 
+    # Сохраняем last_message_id из предыдущего состояния — send_profile_to_vk
+    # сам его удалит и перезапишет на id нового сообщения.
+    prev_last = viewer_state.get(vk_user_id, {}).get("last_message_id")
     viewer_state[vk_user_id] = {
         "target_id": profile["user_id"],
         "photo_idx": 0,
         "photos": photos,
+        "last_message_id": prev_last,
     }
     await db.set_last_shown(db_id, profile["user_id"])
 
@@ -981,6 +1036,9 @@ async def handle_swipe_action(vk_user_id: int, action: str):
         return
 
     if action == "stop":
+        # Удаляем последнюю показанную анкету — чтобы чат остался чистым после выхода
+        if st and st.get("last_message_id"):
+            delete_message_silently(st["last_message_id"])
         viewer_state.pop(vk_user_id, None)
         send_message(vk_user_id, "Окей, остановились.",
                      keyboard=main_menu_keyboard())
@@ -1033,10 +1091,13 @@ async def handle_swipe_action(vk_user_id: int, action: str):
         if not photos:
             photos = [{"photo_id": prev["photo_id"],
                        "file_path": prev.get("photo_path")}]
+        # Сохраняем last_message_id — send_profile_to_vk удалит предыдущее
+        prev_last = viewer_state.get(vk_user_id, {}).get("last_message_id")
         viewer_state[vk_user_id] = {
             "target_id": prev["user_id"],
             "photo_idx": 0,
             "photos": photos,
+            "last_message_id": prev_last,
         }
         await db.set_last_shown(db_id, prev["user_id"])
         await send_profile_to_vk(vk_user_id, prev, photos, 0)
@@ -1176,26 +1237,103 @@ async def deliver_pending_notifications_vk():
         await asyncio.sleep(3)
 
 
+async def migrate_marital_by_gender():
+    """Одноразовая миграция: старые анкеты со значением «Не женат / Не замужем»
+    переписываем на гендерно-корректное."""
+    import aiosqlite
+    async with aiosqlite.connect(db.DB_PATH) as conn:
+        # Мужчинам — «Не женат»
+        cur = await conn.execute(
+            "UPDATE users SET marital = 'Не женат' "
+            "WHERE marital = 'Не женат / Не замужем' AND gender = 'M'"
+        )
+        m_count = cur.rowcount
+        # Женщинам — «Не замужем»
+        cur = await conn.execute(
+            "UPDATE users SET marital = 'Не замужем' "
+            "WHERE marital = 'Не женат / Не замужем' AND gender = 'F'"
+        )
+        f_count = cur.rowcount
+        await conn.commit()
+        if m_count or f_count:
+            log.info(f"Миграция marital: М→{m_count}, Ж→{f_count}")
+
+
+async def process_pending_conversations():
+    """При старте обрабатываем «висящие» сообщения — те, что пришли пока бот лежал.
+    Идём по диалогам с непрочитанными от пользователя и обрабатываем последнее как
+    обычное событие message_new."""
+    try:
+        # filter=unanswered — диалоги, где последнее сообщение от пользователя,
+        # а бот ещё не отвечал
+        resp = vk.messages.getConversations(
+            filter="unanswered",
+            count=200,  # хватит на любой реальный объём
+            extended=0,
+        )
+    except vk_api.exceptions.ApiError as e:
+        log.warning(f"getConversations failed: {e}")
+        return
+
+    items = resp.get("items", [])
+    if not items:
+        log.info("Висящих диалогов нет.")
+        return
+
+    log.info(f"Найдено {len(items)} висящих диалогов — обрабатываю…")
+    handled = 0
+    for it in items:
+        last_msg = it.get("last_message") or {}
+        from_id = last_msg.get("from_id")
+        # Только сообщения от пользователей (положительный id, не от сообществ)
+        if not from_id or from_id < 0:
+            continue
+        # Имитируем структуру события Long Poll, чтобы переиспользовать handle_message
+        class FakeEvent:
+            pass
+        fake = FakeEvent()
+        fake.obj = type("Obj", (), {"message": last_msg})()
+        try:
+            await handle_message(fake)
+            handled += 1
+        except Exception as e:
+            log.exception(f"Не смог обработать висящее сообщение от {from_id}: {e}")
+    log.info(f"Обработано висящих диалогов: {handled}")
+
+
 async def main():
     await db.init_db()
     db.ensure_photos_dir()
+
+    # Миграция семейного положения по полу (одноразовая, идемпотентная)
+    await migrate_marital_by_gender()
+
     log.info(f"VK-бот запущен. Group ID: {VK_GROUP_ID_INT}")
     log.info(f"Обязательная группа: {VK_REQUIRED_GROUP or '(нет)'}")
 
     # Фоновая задача доставки уведомлений
     asyncio.create_task(deliver_pending_notifications_vk())
 
+    # Обрабатываем сообщения, которые пришли пока бот не работал
+    await process_pending_conversations()
+
     event_queue: queue.Queue = queue.Queue()
     stop_flag = threading.Event()
 
     def background_listen():
-        try:
-            for event in longpoll.listen():
-                if stop_flag.is_set():
-                    break
-                event_queue.put(event)
-        except Exception as e:
-            log.error(f"Фоновый поток упал: {e}")
+        """Long Poll с автоматическим переподключением при разрывах сети."""
+        import time
+        while not stop_flag.is_set():
+            try:
+                for event in longpoll.listen():
+                    if stop_flag.is_set():
+                        break
+                    event_queue.put(event)
+            except Exception as e:
+                # Таймауты Long Poll, разрывы сети — нормальное явление.
+                # Просто пере-подключаемся через 2 секунды.
+                log.warning(f"Long Poll переподключение после ошибки: {e}")
+                time.sleep(2)
 
     thread = threading.Thread(target=background_listen, daemon=True)
     thread.start()
