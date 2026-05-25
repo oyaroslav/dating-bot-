@@ -77,6 +77,7 @@ async def init_db():
             CREATE TABLE IF NOT EXISTS reports (
                 reporter_id  INTEGER NOT NULL,
                 target_id    INTEGER NOT NULL,
+                reason       TEXT,
                 reported_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 PRIMARY KEY (reporter_id, target_id)
             );
@@ -155,6 +156,14 @@ async def init_db():
         if "file_path" not in photos_cols:
             await conn.execute(
                 "ALTER TABLE user_photos ADD COLUMN file_path TEXT"
+            )
+
+        # Поле reason в reports (добавилось позже, миграция для старых баз)
+        cur = await conn.execute("PRAGMA table_info(reports)")
+        reports_cols = {row[1] for row in await cur.fetchall()}
+        if "reason" not in reports_cols:
+            await conn.execute(
+                "ALTER TABLE reports ADD COLUMN reason TEXT"
             )
 
         await conn.commit()
@@ -261,6 +270,18 @@ async def get_user(user_id: int):
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def get_user_by_username(username: str):
+    """Поиск пользователя по username (для @username в админ-командах).
+    Сравнение регистронезависимое."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(
+            "SELECT * FROM users WHERE LOWER(username) = LOWER(?)", (username,)
+        )
         row = await cur.fetchone()
         return dict(row) if row else None
 
@@ -487,12 +508,16 @@ async def get_all_bans():
 
 # ============= ЖАЛОБЫ =============
 
-async def add_report(reporter_id: int, target_id: int):
+async def add_report(reporter_id: int, target_id: int, reason: str = None):
+    """Записывает жалобу с причиной."""
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute("""
-            INSERT OR IGNORE INTO reports (reporter_id, target_id)
-            VALUES (?, ?)
-        """, (reporter_id, target_id))
+            INSERT INTO reports (reporter_id, target_id, reason)
+            VALUES (?, ?, ?)
+            ON CONFLICT(reporter_id, target_id) DO UPDATE SET
+                reason = COALESCE(excluded.reason, reports.reason),
+                reported_at = CURRENT_TIMESTAMP
+        """, (reporter_id, target_id, reason))
         await conn.commit()
 
 
@@ -515,12 +540,12 @@ async def count_reports(target_id: int) -> int:
 
 
 async def get_recent_reports(limit: int = 20):
-    """Последние жалобы с именами участников."""
+    """Последние жалобы с именами участников и причинами."""
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
         cur = await conn.execute("""
             SELECT
-                r.reporter_id, r.target_id, r.reported_at,
+                r.reporter_id, r.target_id, r.reported_at, r.reason,
                 ur.name AS reporter_name,
                 ut.name AS target_name
             FROM reports r
@@ -529,6 +554,22 @@ async def get_recent_reports(limit: int = 20):
             ORDER BY r.reported_at DESC
             LIMIT ?
         """, (limit,))
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def get_reports_on(target_id: int, limit: int = 20):
+    """Жалобы на конкретного пользователя с причинами."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("""
+            SELECT r.reporter_id, r.reason, r.reported_at, ur.name AS reporter_name
+            FROM reports r
+            LEFT JOIN users ur ON ur.user_id = r.reporter_id
+            WHERE r.target_id = ?
+            ORDER BY r.reported_at DESC
+            LIMIT ?
+        """, (target_id, limit))
         rows = await cur.fetchall()
         return [dict(r) for r in rows]
 
@@ -951,7 +992,8 @@ async def queue_match_notification(recipient_id: int, partner_id: int):
         await conn.commit()
 
 
-async def queue_admin_report(reporter_id: int, target_id: int, total: int):
+async def queue_admin_report(reporter_id: int, target_id: int, total: int,
+                              reason: str = None):
     """Жалоба от VK-юзера на кого-то — нужно уведомить TG-админов."""
     import json
     await _ensure_notifications_table()
@@ -959,6 +1001,7 @@ async def queue_admin_report(reporter_id: int, target_id: int, total: int):
         "reporter_id": reporter_id,
         "target_id": target_id,
         "total": total,
+        "reason": reason,
     })
     async with aiosqlite.connect(DB_PATH) as conn:
         await conn.execute(
@@ -968,9 +1011,25 @@ async def queue_admin_report(reporter_id: int, target_id: int, total: int):
         await conn.commit()
 
 
-async def get_pending_notifications(kinds: tuple = ("match", "admin_report"),
-                                    limit: int = 100):
-    """Возвращает недоставленные уведомления. TG-бот будет вызывать эту
+async def queue_system_message(recipient_id: int, text: str):
+    """Системное сообщение в VK или TG (например, уведомление о бане).
+    Кладём в общую очередь — соответствующий бот разошлёт."""
+    import json
+    await _ensure_notifications_table()
+    payload = json.dumps({"text": text})
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "INSERT INTO pending_notifications (kind, recipient_id, payload) "
+            "VALUES ('system_message', ?, ?)",
+            (recipient_id, payload),
+        )
+        await conn.commit()
+
+
+async def get_pending_notifications(
+        kinds: tuple = ("match", "admin_report", "system_message"),
+        limit: int = 100):
+    """Возвращает недоставленные уведомления. Бот будет вызывать эту
     функцию из фоновой задачи."""
     placeholders = ",".join("?" for _ in kinds)
     async with aiosqlite.connect(DB_PATH) as conn:

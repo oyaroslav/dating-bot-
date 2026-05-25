@@ -56,6 +56,47 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
+# ----------- Парсер target_id для админ-команд -----------
+# Принимает любую разумную форму:
+#   123456            → TG-юзер 123456
+#   -123456           → VK-юзер -123456
+#   vk.com/id123456   → VK-юзер -123456
+#   https://vk.com/id123456 → то же самое
+#   @username         → TG-юзер по username (если есть в нашей БД)
+#   t.me/username     → то же самое
+import re as _re
+_VK_ID_RE = _re.compile(r"vk\.com/(?:id)?(\d+)")
+_TG_USERNAME_RE = _re.compile(r"(?:t\.me/|@)([A-Za-z][\w]{3,31})")
+
+
+async def parse_target_id(arg: str) -> int | None:
+    """Превращает строку в db_user_id. Возвращает None если не распознано
+    или пользователь не найден (для @username)."""
+    if not arg:
+        return None
+    arg = arg.strip()
+
+    # Прямое число (TG-id положительный, VK-id отрицательный)
+    try:
+        return int(arg)
+    except ValueError:
+        pass
+
+    # vk.com/id12345 → -12345
+    m = _VK_ID_RE.search(arg)
+    if m:
+        return -int(m.group(1))
+
+    # @username или t.me/username → ищем в нашей БД
+    m = _TG_USERNAME_RE.search(arg)
+    if m:
+        username = m.group(1)
+        user = await db.get_user_by_username(username)
+        if user:
+            return user["user_id"]
+
+    return None
+
 # ----------- Обязательная подписка на каналы -----------
 # Формат в .env: REQUIRED_CHANNELS=@channel1,@channel2,-1001234567890
 # Можно использовать как @username, так и числовой id (для приватных каналов).
@@ -294,6 +335,11 @@ class Form(StatesGroup):
     children = State()
     hobbies = State()
     photo = State()
+
+
+class ReportForm(StatesGroup):
+    """Отдельный FSM для жалобы — пользователь нажал 🚩 и теперь пишет причину."""
+    reason = State()
 
 
 # ----------- Клавиатуры -----------
@@ -907,6 +953,61 @@ async def show_next_profile(user_id: int, chat_id: int,
     await show_profile_to(user_id, chat_id, profile["user_id"], 0, edit_message)
 
 
+# ----------- Жалоба: получение причины и отмена -----------
+@router.message(ReportForm.reason, F.text)
+async def report_form_reason(message: Message, state: FSMContext):
+    reason = (message.text or "").strip()
+    if not (30 <= len(reason) <= 200):
+        await message.answer(
+            f"Причина должна быть от 30 до 200 символов "
+            f"(сейчас {len(reason)}). Попробуй ещё раз или нажми «Отмена».",
+        )
+        return
+
+    data = await state.get_data()
+    target_id = data.get("report_target_id")
+    user_id = message.from_user.id
+
+    if not target_id:
+        # На всякий случай — если потеряли target
+        await state.clear()
+        await message.answer("Что-то пошло не так. Попробуй ещё раз.")
+        return
+
+    # Проверяем повторную жалобу прямо здесь — на случай если пользователь
+    # параллельно успел отправить жалобу с другого устройства
+    already = await db.has_reported(user_id, target_id)
+    if already:
+        await state.clear()
+        await message.answer("Ты уже жаловался на эту анкету.")
+        return
+
+    await db.add_report(user_id, target_id, reason=reason)
+    total = await db.count_reports(target_id)
+    await state.clear()
+    await message.answer(
+        "✅ Жалоба отправлена администрации. Спасибо!",
+        reply_markup=main_menu_kb(),
+    )
+    await notify_admins_about_report(user_id, target_id, total, reason=reason)
+
+
+@router.message(ReportForm.reason)
+async def report_form_reason_invalid(message: Message):
+    """На случай не-текстовых сообщений в этом состоянии."""
+    await message.answer("Напиши причину текстом (30–200 символов) или нажми «Отмена».")
+
+
+@router.callback_query(F.data == "report_cancel")
+async def report_cancel(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.answer("Отменено")
+    try:
+        await call.message.edit_text("❌ Жалоба отменена.")
+    except Exception:
+        pass
+
+
 @router.message(F.text == "🔍 Смотреть анкеты")
 async def browse_profiles(message: Message):
     if not await require_subscription(message):
@@ -920,7 +1021,7 @@ async def browse_profiles(message: Message):
 
 # ----------- Свайпы и листание -----------
 @router.callback_query(F.data.startswith("swipe:"))
-async def on_swipe(call: CallbackQuery):
+async def on_swipe(call: CallbackQuery, state: FSMContext):
     action = call.data.split(":")[1]
     user_id = call.from_user.id
 
@@ -942,7 +1043,7 @@ async def on_swipe(call: CallbackQuery):
     st = viewer_state.get(user_id)
     target_id = st["target_id"] if st else await db.get_last_shown(user_id)
 
-    # Жалоба — записываем в базу и уведомляем админов
+    # Жалоба — запрашиваем причину, потом записываем и уведомляем админов
     if action == "report":
         if not target_id:
             await call.answer("Сначала открой анкету.", show_alert=True)
@@ -951,10 +1052,24 @@ async def on_swipe(call: CallbackQuery):
         if already:
             await call.answer("Ты уже жаловался на эту анкету.", show_alert=True)
             return
-        await db.add_report(user_id, target_id)
-        total = await db.count_reports(target_id)
-        await call.answer("🚩 Жалоба принята. Спасибо!", show_alert=True)
-        await notify_admins_about_report(user_id, target_id, total)
+
+        await call.answer()
+        # Кнопка отмены — на случай если человек случайно нажал 🚩
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="❌ Отмена",
+                                 callback_data="report_cancel"),
+        ]])
+        # Сохраняем target_id в FSM, переводим в ожидание причины
+        await state.set_state(ReportForm.reason)
+        await state.update_data(report_target_id=target_id)
+        await bot.send_message(
+            user_id,
+            "🚩 <b>Жалоба на эту анкету</b>\n\n"
+            "Напиши причину жалобы (30–200 символов). "
+            "Это поможет администраторам разобраться.\n\n"
+            "Если нажал случайно — нажми <b>«❌ Отмена»</b>.",
+            reply_markup=cancel_kb,
+        )
         return
 
     # СТРЕЛКА ВПРАВО ▶ — листаем фото внутри анкеты, на последнем → следующая анкета
@@ -1113,19 +1228,29 @@ async def my_matches(message: Message):
 
 
 # ----------- Уведомление админов о жалобах -----------
-async def notify_admins_about_report(reporter_id: int, target_id: int, total: int):
-    """Шлём всем админам уведомление о новой жалобе."""
+async def notify_admins_about_report(reporter_id: int, target_id: int,
+                                      total: int, reason: str = None):
+    """Шлём всем админам уведомление о новой жалобе с причиной."""
     if not ADMIN_IDS:
         return
     target = await db.get_user(target_id)
     reporter = await db.get_user(reporter_id)
     target_name = target["name"] if target else f"id {target_id}"
     reporter_name = reporter["name"] if reporter else f"id {reporter_id}"
+
+    reason_block = ""
+    if reason:
+        # Экранируем HTML, чтобы случайные < > не сломали разметку
+        safe = (reason.replace("&", "&amp;")
+                       .replace("<", "&lt;").replace(">", "&gt;"))
+        reason_block = f"\n<b>Причина:</b>\n<i>{safe}</i>\n"
+
     text = (
         f"🚩 <b>Новая жалоба</b>\n\n"
         f"От: <b>{reporter_name}</b> (id <code>{reporter_id}</code>)\n"
         f"На: <b>{target_name}</b> (id <code>{target_id}</code>)\n"
-        f"Всего жалоб на этого пользователя: <b>{total}</b>\n\n"
+        f"Всего жалоб на этого пользователя: <b>{total}</b>\n"
+        f"{reason_block}\n"
         f"<b>Действия:</b>\n"
         f"• Анкета нарушителя: <code>/userinfo {target_id}</code>\n"
         f"• Кто жалуется: <code>/userinfo {reporter_id}</code>\n"
@@ -1264,10 +1389,13 @@ async def cmd_ban(message: Message):
     if not is_admin(message.from_user.id):
         return
     parts = (message.text or "").split(maxsplit=2)
-    if len(parts) < 2 or not parts[1].isdigit():
+    if len(parts) < 2:
         await message.answer("Использование: <code>/ban ID причина</code>")
         return
-    target_id = int(parts[1])
+    target_id = await parse_target_id(parts[1])
+    if target_id is None:
+        await message.answer("Не распознал ID. Можно: число, vk.com/idXXX, @username.")
+        return
     reason = parts[2] if len(parts) > 2 else "не указана"
 
     if is_admin(target_id):
@@ -1283,16 +1411,21 @@ async def cmd_ban(message: Message):
         f"Причина: {reason}"
     )
 
-    # Сообщаем забаненному
-    try:
-        await bot.send_message(
-            target_id,
-            f"⛔ Ты заблокирован администратором.\n"
-            f"Причина: {reason}\n\n"
-            f"Если считаешь это ошибкой — напиши администратору."
-        )
-    except Exception:
-        pass  # пользователь мог заблокировать бота
+    # Сообщаем забаненному. Для TG-юзеров — напрямую. Для VK — в очередь,
+    # которую разгребёт VK-бот.
+    ban_text = (
+        f"⛔ Ты заблокирован администратором.\n"
+        f"Причина: {reason}\n\n"
+        f"Если считаешь это ошибкой — напиши администратору."
+    )
+    if db.is_tg_user(target_id):
+        try:
+            await bot.send_message(target_id, ban_text)
+        except Exception:
+            pass  # пользователь мог заблокировать бота
+    else:
+        # VK — кладём в очередь как «системное сообщение»
+        await db.queue_system_message(target_id, ban_text)
 
 
 @router.message(Command("unban"))
@@ -1300,17 +1433,24 @@ async def cmd_unban(message: Message):
     if not is_admin(message.from_user.id):
         return
     parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
+    if len(parts) < 2:
         await message.answer("Использование: <code>/unban ID</code>")
         return
-    target_id = int(parts[1])
+    target_id = await parse_target_id(parts[1])
+    if target_id is None:
+        await message.answer("Не распознал ID. Можно: число, vk.com/idXXX, @username.")
+        return
     ok = await db.unban_user(target_id)
     if ok:
         await message.answer(f"✅ Пользователь id {target_id} разбанен.")
-        try:
-            await bot.send_message(target_id, "✅ Тебя разбанили. Можешь снова пользоваться ботом.")
-        except Exception:
-            pass
+        unban_text = "✅ Тебя разбанили. Можешь снова пользоваться ботом."
+        if db.is_tg_user(target_id):
+            try:
+                await bot.send_message(target_id, unban_text)
+            except Exception:
+                pass
+        else:
+            await db.queue_system_message(target_id, unban_text)
     else:
         await message.answer(f"Пользователь id {target_id} не был забанен.")
 
@@ -1339,10 +1479,13 @@ async def cmd_baninfo(message: Message):
     if not is_admin(message.from_user.id):
         return
     parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
+    if len(parts) < 2:
         await message.answer("Использование: <code>/baninfo ID</code>")
         return
-    target_id = int(parts[1])
+    target_id = await parse_target_id(parts[1])
+    if target_id is None:
+        await message.answer("Не распознал ID. Можно: число, vk.com/idXXX, @username.")
+        return
     u = await db.get_user(target_id)
     reports_count = await db.count_reports(target_id)
     ban = await db.get_ban(target_id)
@@ -1376,6 +1519,24 @@ async def cmd_baninfo(message: Message):
     except Exception:
         await message.answer(caption)
 
+    # Дополнительно — последние жалобы на этого пользователя с причинами
+    if reports_count > 0:
+        reports = await db.get_reports_on(target_id, limit=10)
+        if reports:
+            lines = ["<b>🚩 Последние жалобы:</b>\n"]
+            for r in reports:
+                reporter = r["reporter_name"] or f"id {r['reporter_id']}"
+                rsn = r.get("reason")
+                if rsn:
+                    safe = (rsn.replace("&", "&amp;")
+                                .replace("<", "&lt;").replace(">", "&gt;"))
+                    if len(safe) > 200:
+                        safe = safe[:200] + "…"
+                    lines.append(f"• От {reporter}: <i>{safe}</i>")
+                else:
+                    lines.append(f"• От {reporter}: <i>(без причины — старая жалоба)</i>")
+            await message.answer("\n".join(lines))
+
 
 # ----------- /userinfo — полное досье на пользователя -----------
 @router.message(Command("userinfo"))
@@ -1383,10 +1544,21 @@ async def cmd_userinfo(message: Message):
     if not is_admin(message.from_user.id):
         return
     parts = (message.text or "").split()
-    if len(parts) < 2 or not parts[1].isdigit():
-        await message.answer("Использование: <code>/userinfo ID</code>")
+    if len(parts) < 2:
+        await message.answer(
+            "Использование: <code>/userinfo ID</code>\n\n"
+            "ID можно указать как:\n"
+            "• Число (TG: положительное, VK: отрицательное)\n"
+            "• Ссылку vk.com/idXXXX\n"
+            "• @username (для TG)"
+        )
         return
-    target_id = int(parts[1])
+    target_id = await parse_target_id(parts[1])
+    if target_id is None:
+        await message.answer(
+            "Не распознал ID. Можно: число, vk.com/idXXX, @username."
+        )
+        return
     info = await db.get_user_info(target_id)
     u = info["profile"]
     ban = info["ban"]
@@ -1419,14 +1591,33 @@ async def cmd_userinfo(message: Message):
                 f"{info['my_reports']} жалоб на {my_total} свайпов ({report_rate}%)"
             )
 
+    # Платформа и публичная ссылка
+    if db.is_vk_user(target_id):
+        platform_label = "🌐 VK"
+        public_link = f"https://vk.com/id{db.db_id_to_vk_id(target_id)}"
+    else:
+        platform_label = "📱 Telegram"
+        if u and u.get("username"):
+            public_link = f"https://t.me/{u['username']}"
+        else:
+            public_link = None
+
     body = (
         f"{status}\n"
         f"id: <code>{target_id}</code>\n"
+        f"Платформа: {platform_label}\n"
     )
+    if public_link:
+        body += f'Ссылка: <a href="{public_link}">{public_link}</a>\n'
+    body += "\n"
 
     if u:
+        if db.is_vk_user(target_id):
+            username_line = f"VK: {u['username'] or '(нет screen_name)'}\n"
+        else:
+            username_line = f"@{u['username'] or '(нет username)'}\n"
         body += (
-            f"@{u['username'] or '(нет username)'}\n\n"
+            username_line + "\n"
             f"<b>{u['name']}, {u['age']}</b>\n"
             f"📍 {u['city']}\n"
             f"⛪ {u['church']}\n"
@@ -1436,7 +1627,7 @@ async def cmd_userinfo(message: Message):
             f"<b>О себе:</b>\n{u['hobbies']}\n"
         )
     else:
-        body += "\n<i>Анкеты нет</i>\n"
+        body += "<i>Анкеты нет</i>\n"
 
     body += (
         f"\n━━━━━━━━━━━━━━━━━━━━\n"
@@ -1483,9 +1674,18 @@ async def cmd_reports(message: Message):
     for r in reports:
         target_name = r["target_name"] or f"id {r['target_id']}"
         reporter_name = r["reporter_name"] or f"id {r['reporter_id']}"
-        lines.append(
+        reason = r.get("reason")
+        line = (
             f"• <b>{target_name}</b> (id {r['target_id']}) ← от {reporter_name}"
         )
+        if reason:
+            # Экранируем HTML; обрезаем длинное
+            safe = (reason.replace("&", "&amp;")
+                          .replace("<", "&lt;").replace(">", "&gt;"))
+            if len(safe) > 100:
+                safe = safe[:100] + "…"
+            line += f"\n   <i>{safe}</i>"
+        lines.append(line)
     lines.append("\nПодробнее: <code>/baninfo ID</code>")
     await message.answer("\n".join(lines))
 
@@ -1574,7 +1774,28 @@ async def deliver_pending_notifications():
                         reporter_id = payload.get("reporter_id")
                         target_id = payload.get("target_id")
                         total = payload.get("total", 0)
-                        await notify_admins_about_report(reporter_id, target_id, total)
+                        reason = payload.get("reason")
+                        await notify_admins_about_report(
+                            reporter_id, target_id, total, reason=reason,
+                        )
+                        await db.mark_notification_delivered(n["id"])
+
+                    elif n["kind"] == "system_message":
+                        recipient = n["recipient_id"]
+                        # TG-бот обрабатывает только своих получателей.
+                        # VK-получателей возьмёт VK-бот.
+                        if recipient is None or not db.is_tg_user(recipient):
+                            continue
+                        import json
+                        payload = json.loads(n["payload"] or "{}")
+                        text = payload.get("text", "")
+                        if text:
+                            try:
+                                await bot.send_message(recipient, text)
+                            except Exception as e:
+                                logging.warning(
+                                    f"system_message TG to {recipient} failed: {e}"
+                                )
                         await db.mark_notification_delivered(n["id"])
                 except Exception as e:
                     logging.exception(f"Доставка уведомления {n['id']} упала: {e}")

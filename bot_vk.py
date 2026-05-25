@@ -769,6 +769,8 @@ async def handle_message(event):
         await handle_form_children(vk_user_id, text)
     elif state == "hobbies":
         await handle_form_hobbies(vk_user_id, text)
+    elif state == "report_reason":
+        await handle_report_reason_text(vk_user_id, text)
     elif state == "photo":
         # Текст на этапе фото — подсказка
         send_message(
@@ -851,6 +853,11 @@ async def handle_callback(event):
 
     elif cmd == "forget_cancel":
         send_message(vk_user_id, "Отмена. Данные сохранены.",
+                     keyboard=main_menu_keyboard())
+
+    elif cmd == "report_cancel":
+        set_state(vk_user_id, None)
+        send_message(vk_user_id, "❌ Жалоба отменена.",
                      keyboard=main_menu_keyboard())
 
     elif cmd in ("swipe_like", "swipe_dislike", "swipe_next", "swipe_prev",
@@ -1027,6 +1034,51 @@ async def show_next_profile(vk_user_id: int):
     await send_profile_to_vk(vk_user_id, profile, photos, 0)
 
 
+async def handle_report_reason_text(vk_user_id: int, text: str):
+    """Обработка текста причины жалобы (FSM state=report_reason)."""
+    reason = (text or "").strip()
+    if not (30 <= len(reason) <= 200):
+        cancel_kb = VkKeyboard(inline=True)
+        cancel_kb.add_callback_button(
+            "❌ Отмена", color=VkKeyboardColor.SECONDARY,
+            payload={"cmd": "report_cancel"},
+        )
+        send_message(
+            vk_user_id,
+            f"Причина должна быть от 30 до 200 символов "
+            f"(сейчас {len(reason)}). Попробуй ещё раз или нажми «Отмена».",
+            keyboard=cancel_kb,
+        )
+        return
+
+    data = get_data(vk_user_id)
+    target_id = data.get("report_target_id")
+    db_id = db.vk_id_to_db_id(vk_user_id)
+
+    if not target_id:
+        set_state(vk_user_id, None)
+        send_message(vk_user_id, "Что-то пошло не так. Попробуй ещё раз.",
+                     keyboard=main_menu_keyboard())
+        return
+
+    already = await db.has_reported(db_id, target_id)
+    if already:
+        set_state(vk_user_id, None)
+        send_message(vk_user_id, "Ты уже жаловался на эту анкету.",
+                     keyboard=main_menu_keyboard())
+        return
+
+    await db.add_report(db_id, target_id, reason=reason)
+    total = await db.count_reports(target_id)
+    set_state(vk_user_id, None)
+    send_message(
+        vk_user_id,
+        "✅ Жалоба отправлена администрации. Спасибо!",
+        keyboard=main_menu_keyboard(),
+    )
+    await notify_admins_about_report_vk(db_id, target_id, total, reason=reason)
+
+
 async def handle_swipe_action(vk_user_id: int, action: str):
     """Обработка ❤️ ❌ ◀ ▶ 🚩 ⏹ внутри ленты."""
     db_id = db.vk_id_to_db_id(vk_user_id)
@@ -1046,7 +1098,7 @@ async def handle_swipe_action(vk_user_id: int, action: str):
 
     target_id = st["target_id"] if st else await db.get_last_shown(db_id)
 
-    # Жалоба
+    # Жалоба — запрашиваем причину (FSM state="report_reason")
     if action == "report":
         if not target_id:
             send_message(vk_user_id, "Сначала открой анкету.")
@@ -1055,10 +1107,25 @@ async def handle_swipe_action(vk_user_id: int, action: str):
         if already:
             send_message(vk_user_id, "Ты уже жаловался на эту анкету.")
             return
-        await db.add_report(db_id, target_id)
-        total = await db.count_reports(target_id)
-        send_message(vk_user_id, "🚩 Жалоба принята. Спасибо!")
-        await notify_admins_about_report_vk(db_id, target_id, total)
+        # Сохраняем target в state.data, переводим в режим ожидания причины
+        set_state(vk_user_id, "report_reason", report_target_id=target_id)
+        # Удаляем текущую анкету из чата — чтобы не отвлекала
+        if st and st.get("last_message_id"):
+            delete_message_silently(st["last_message_id"])
+        # Кнопка отмены
+        cancel_kb = VkKeyboard(inline=True)
+        cancel_kb.add_callback_button(
+            "❌ Отмена", color=VkKeyboardColor.SECONDARY,
+            payload={"cmd": "report_cancel"},
+        )
+        send_message(
+            vk_user_id,
+            "🚩 Жалоба на эту анкету\n\n"
+            "Напиши причину жалобы (30–200 символов). "
+            "Это поможет администраторам разобраться.\n\n"
+            "Если нажал случайно — нажми «❌ Отмена».",
+            keyboard=cancel_kb,
+        )
         return
 
     # Стрелки — листание фото внутри анкеты или переход к соседней
@@ -1169,11 +1236,12 @@ async def notify_match(user_a_id: int, user_b_id: int):
         await db.queue_match_notification(user_b_id, user_a_id)
 
 
-async def notify_admins_about_report_vk(reporter_id: int, target_id: int, total: int):
+async def notify_admins_about_report_vk(reporter_id: int, target_id: int,
+                                          total: int, reason: str = None):
     """Уведомление админов о жалобе (от VK-юзера) — через Telegram-бота.
     Нам нужно «попросить» TG-бот разослать админам, но из VK-процесса
     напрямую отправить в TG мы не можем. Решение: кладём в очередь."""
-    await db.queue_admin_report(reporter_id, target_id, total)
+    await db.queue_admin_report(reporter_id, target_id, total, reason=reason)
 
 
 async def show_my_matches(vk_user_id: int):
@@ -1202,32 +1270,47 @@ async def show_my_matches(vk_user_id: int):
 
 async def deliver_pending_notifications_vk():
     """Раз в 3 секунды смотрим очередь pending_notifications.
-    VK-бот доставляет матчи, где получатель — VK-юзер.
-    Записи для TG-юзеров обрабатывает TG-бот."""
+    VK-бот доставляет:
+      - match для VK-получателей (TG-получателей возьмёт TG-бот)
+      - system_message для VK-получателей (бан/разбан и т.п.)"""
     while True:
         try:
-            notifications = await db.get_pending_notifications(kinds=("match",))
+            notifications = await db.get_pending_notifications(
+                kinds=("match", "system_message"),
+            )
             for n in notifications:
                 recipient = n["recipient_id"]
                 if recipient is None or not db.is_vk_user(recipient):
                     # Не наш — не трогаем (доставит TG-бот)
                     continue
                 try:
-                    partner_id = n["partner_id"]
-                    partner = await db.get_user(partner_id)
-                    if not partner:
-                        await db.mark_notification_delivered(n["id"])
-                        continue
-                    text = (
-                        f"🎉 Вы понравились друг другу!\n\n"
-                        f"{partner['name']}, {partner['age']}\n"
-                        f"Контакт: {db.contact_link(partner)}"
-                    )
                     vk_uid = db.db_id_to_vk_id(recipient)
-                    attachment = None
-                    if partner.get("photo_path") and os.path.exists(partner["photo_path"]):
-                        attachment = upload_photo_to_messages(partner["photo_path"], vk_uid)
-                    send_message(vk_uid, text, attachment=attachment)
+
+                    if n["kind"] == "match":
+                        partner_id = n["partner_id"]
+                        partner = await db.get_user(partner_id)
+                        if not partner:
+                            await db.mark_notification_delivered(n["id"])
+                            continue
+                        text = (
+                            f"🎉 Вы понравились друг другу!\n\n"
+                            f"{partner['name']}, {partner['age']}\n"
+                            f"Контакт: {db.contact_link(partner)}"
+                        )
+                        attachment = None
+                        if partner.get("photo_path") and os.path.exists(partner["photo_path"]):
+                            attachment = upload_photo_to_messages(
+                                partner["photo_path"], vk_uid,
+                            )
+                        send_message(vk_uid, text, attachment=attachment)
+
+                    elif n["kind"] == "system_message":
+                        import json
+                        payload = json.loads(n["payload"] or "{}")
+                        text = payload.get("text", "")
+                        if text:
+                            send_message(vk_uid, text)
+
                     await db.mark_notification_delivered(n["id"])
                 except Exception as e:
                     log.exception(f"Доставка VK-уведомления {n['id']} упала: {e}")
