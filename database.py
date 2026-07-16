@@ -24,6 +24,9 @@ async def init_db():
                 partner_age_max  INTEGER NOT NULL DEFAULT 99,
                 city             TEXT NOT NULL,
                 church           TEXT NOT NULL,
+                denomination     TEXT,                    -- конфессия (новое, может быть NULL у старых)
+                church_role      TEXT,                    -- служение в церкви (новое)
+                job              TEXT,                    -- работа/учёба (новое, может быть NULL)
                 marital          TEXT NOT NULL,
                 children         TEXT NOT NULL,
                 hobbies          TEXT NOT NULL,
@@ -166,18 +169,38 @@ async def init_db():
                 "ALTER TABLE reports ADD COLUMN reason TEXT"
             )
 
+        # Новые поля анкеты: конфессия, служение, работа.
+        # У существующих ~500 анкет будут NULL — при следующем заходе
+        # бот попросит их дозаполнить (см. блок «перехват старых юзеров»).
+        if "denomination" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN denomination TEXT"
+            )
+        if "church_role" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN church_role TEXT"
+            )
+        if "job" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN job TEXT"
+            )
+
         await conn.commit()
 
 
 async def save_user(*, user_id, username, name, age, gender, looking_for,
                     partner_age_min, partner_age_max,
                     city, church, marital, children, hobbies, photos,
+                    denomination=None, church_role=None, job=None,
                     platform="tg"):
     """Сохраняем пользователя и его фотографии.
     photos — список фотографий. Каждый элемент может быть:
       - строкой (старый формат, photo_id) — тогда file_path = None
       - словарём {photo_id, file_path}
     Первый элемент = обложка.
+    denomination — конфессия (обязательно для НОВЫХ анкет, может быть None для старых)
+    church_role — служение в церкви (обязательно для НОВЫХ)
+    job — работа/учёба (может быть None — пользователь пропустил)
     """
     if gender not in ("M", "F"):
         raise ValueError("gender должен быть 'M' или 'F'")
@@ -213,9 +236,10 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
         await conn.execute("""
             INSERT INTO users (user_id, username, name, age, gender, looking_for,
                                partner_age_min, partner_age_max,
-                               city, church, marital, children, hobbies,
+                               city, church, denomination, church_role, job,
+                               marital, children, hobbies,
                                photo_id, photo_path, platform)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 username=excluded.username,
                 name=excluded.name,
@@ -226,6 +250,9 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
                 partner_age_max=excluded.partner_age_max,
                 city=excluded.city,
                 church=excluded.church,
+                denomination=excluded.denomination,
+                church_role=excluded.church_role,
+                job=excluded.job,
                 marital=excluded.marital,
                 children=excluded.children,
                 hobbies=excluded.hobbies,
@@ -234,7 +261,8 @@ async def save_user(*, user_id, username, name, age, gender, looking_for,
                 platform=excluded.platform
         """, (user_id, username, name, age, gender, looking_for,
               partner_age_min, partner_age_max,
-              city, church, marital, children, hobbies,
+              city, church, denomination, church_role, job,
+              marital, children, hobbies,
               cover["photo_id"], cover["file_path"], platform))
 
         # Перезаписываем список фото — старые удаляем, новые вставляем
@@ -1027,7 +1055,7 @@ async def queue_system_message(recipient_id: int, text: str):
 
 
 async def get_pending_notifications(
-        kinds: tuple = ("match", "admin_report", "system_message"),
+        kinds: tuple = ("match", "admin_report", "system_message", "broadcast"),
         limit: int = 100):
     """Возвращает недоставленные уведомления. Бот будет вызывать эту
     функцию из фоновой задачи."""
@@ -1051,3 +1079,175 @@ async def mark_notification_delivered(notification_id: int):
             (notification_id,),
         )
         await conn.commit()
+
+
+async def update_profile_fields(user_id: int, **fields):
+    """Обновить отдельные поля анкеты не трогая остальное.
+    Используется для дозаполнения старых анкет: конфессия, служение, работа.
+    Допустимые поля: denomination, church_role, job, и любые другие из users.
+    """
+    if not fields:
+        return
+    # Защита: разрешаем обновлять только безопасные поля
+    allowed = {
+        "denomination", "church_role", "job",
+        "name", "age", "city", "church", "hobbies",
+        "marital", "children",
+        "partner_age_min", "partner_age_max",
+    }
+    set_parts = []
+    values = []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        set_parts.append(f"{k} = ?")
+        values.append(v)
+    if not set_parts:
+        return
+    values.append(user_id)
+    sql = f"UPDATE users SET {', '.join(set_parts)} WHERE user_id = ?"
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(sql, values)
+        await conn.commit()
+
+
+async def needs_legacy_fillin(user_id: int) -> bool:
+    """Возвращает True, если у пользователя есть анкета, но ещё не заполнены
+    новые поля (denomination, church_role). job не считаем — он опционален."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT denomination, church_role FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        if not row:
+            return False  # анкеты нет — ничего дозаполнять
+        denom, role = row
+        return not denom or not role
+
+
+# ============= РАССЫЛКА (/rassylka) =============
+
+async def get_broadcast_recipients(
+    platform: str = "all",       # "all" | "tg" | "vk"
+    gender: str = "all",          # "all" | "M" | "F"
+    age_min: int | None = None,   # None = без ограничения
+    age_max: int | None = None,
+    city: str | None = None,      # None = любой
+    denomination: str | None = None,
+):
+    """Возвращает список (user_id, name) — кому отправлять рассылку.
+    Исключаем забаненных и тех, кто не давал согласие."""
+    where = ["1=1"]
+    params = []
+
+    # Фильтр по платформе через знак user_id (положительный=TG, отрицательный=VK)
+    if platform == "tg":
+        where.append("u.user_id > 0")
+    elif platform == "vk":
+        where.append("u.user_id < 0")
+
+    if gender in ("M", "F"):
+        where.append("u.gender = ?")
+        params.append(gender)
+
+    if age_min is not None:
+        where.append("u.age >= ?")
+        params.append(age_min)
+    if age_max is not None:
+        where.append("u.age <= ?")
+        params.append(age_max)
+
+    if city:
+        where.append("LOWER(u.city) = LOWER(?)")
+        params.append(city.strip())
+
+    if denomination:
+        where.append("LOWER(u.denomination) = LOWER(?)")
+        params.append(denomination.strip())
+
+    # Только незабаненные
+    where.append(
+        "NOT EXISTS (SELECT 1 FROM banned b WHERE b.user_id = u.user_id)"
+    )
+    # Только давшие согласие
+    where.append(
+        "EXISTS (SELECT 1 FROM consents c WHERE c.user_id = u.user_id)"
+    )
+
+    sql = f"""
+        SELECT u.user_id, u.name
+        FROM users u
+        WHERE {' AND '.join(where)}
+        ORDER BY u.user_id
+    """
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute(sql, params)
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def count_broadcast_recipients(**filters) -> dict:
+    """Возвращает разбивку по платформам: {'total': N, 'tg': X, 'vk': Y}.
+    Принимает те же фильтры что и get_broadcast_recipients."""
+    recipients = await get_broadcast_recipients(**filters)
+    tg = sum(1 for r in recipients if r["user_id"] > 0)
+    vk = sum(1 for r in recipients if r["user_id"] < 0)
+    return {"total": len(recipients), "tg": tg, "vk": vk}
+
+
+async def list_distinct_cities(min_users: int = 1) -> list[str]:
+    """Список городов где есть хотя бы min_users пользователей. Для админа — справочно."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute("""
+            SELECT city, COUNT(*) as cnt FROM users
+            WHERE EXISTS (SELECT 1 FROM consents c WHERE c.user_id = users.user_id)
+              AND NOT EXISTS (SELECT 1 FROM banned b WHERE b.user_id = users.user_id)
+            GROUP BY LOWER(city) HAVING cnt >= ?
+            ORDER BY cnt DESC
+        """, (min_users,))
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
+
+
+# ============= ОЧЕРЕДЬ РАССЫЛОК (для VK) =============
+# VK-бот опрашивает очередь и отправляет тем VK-юзерам, которых ему назначил TG-бот.
+# Так мы не дублируем код отправки в двух процессах.
+
+async def queue_broadcast_chunk(vk_user_ids: list[int], text: str,
+                                 batch_id: int):
+    """Кладёт партию VK-получателей в очередь. VK-бот их разошлёт.
+    batch_id — общий идентификатор рассылки (для статистики)."""
+    import json
+    await _ensure_notifications_table()
+    payload = json.dumps({"text": text, "batch_id": batch_id})
+    async with aiosqlite.connect(DB_PATH) as conn:
+        for vk_id in vk_user_ids:
+            await conn.execute(
+                "INSERT INTO pending_notifications (kind, recipient_id, payload) "
+                "VALUES ('broadcast', ?, ?)",
+                (vk_id, payload),
+            )
+        await conn.commit()
+
+
+async def get_broadcast_stats(batch_id: int) -> dict:
+    """Сколько уже доставлено для конкретной рассылки (VK-часть).
+    Возвращает {'delivered': X, 'pending': Y}"""
+    import json
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute("""
+            SELECT delivered, COUNT(*) FROM pending_notifications
+            WHERE kind = 'broadcast'
+              AND json_extract(payload, '$.batch_id') = ?
+            GROUP BY delivered
+        """, (batch_id,))
+        rows = await cur.fetchall()
+        result = {"delivered": 0, "pending": 0}
+        for delivered, count in rows:
+            if delivered:
+                result["delivered"] = count
+            else:
+                result["pending"] = count
+        return result

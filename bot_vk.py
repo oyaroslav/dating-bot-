@@ -34,12 +34,25 @@ VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
 VK_GROUP_ID = os.getenv("VK_GROUP_ID", "").strip()
 VK_REQUIRED_GROUP = os.getenv("VK_REQUIRED_GROUP", "").strip()
 
+# ID администраторов в ВК (через запятую в .env).
+# Например: VK_ADMIN_IDS=99046865,12345678
+# Эти пользователи могут запускать команду «rassylka» в ВК.
+VK_ADMIN_IDS: set[int] = set()
+for _x in os.getenv("VK_ADMIN_IDS", "").split(","):
+    _x = _x.strip()
+    if _x.isdigit():
+        VK_ADMIN_IDS.add(int(_x))
+
 if not VK_TOKEN or not VK_GROUP_ID:
     raise RuntimeError(
         "VK_TOKEN или VK_GROUP_ID не заданы в .env."
     )
 
 VK_GROUP_ID_INT = int(VK_GROUP_ID)
+
+
+def vk_is_admin(vk_user_id: int) -> bool:
+    return vk_user_id in VK_ADMIN_IDS
 
 logging.basicConfig(
     level=logging.INFO,
@@ -98,8 +111,27 @@ user_states: dict[int, dict] = {}
 STATES = (
     "name", "age", "gender",
     "partner_age_min", "partner_age_max",
-    "city", "church", "marital", "children", "hobbies", "photo",
+    "city",
+    "denomination", "denomination_other",
+    "church",
+    "church_role", "job",
+    "marital", "children", "hobbies", "photo",
+    # Дозаполнение старых анкет:
+    "legacy_denomination", "legacy_denomination_other",
+    "legacy_church_role", "legacy_job",
+    # Жалоба:
+    "report_reason",
+    # Рассылка (только для админов):
+    "bc_text", "bc_age", "bc_city",
 )
+
+
+# Список конфессий (синхронизировано с TG-ботом)
+DENOMINATIONS = [
+    "Баптисты", "Пятидесятники", "АСД",
+    "Евангельские Христиане", "Лютеране", "Православные",
+    "Католики", "Методисты", "Пресвитериане",
+]
 
 
 def get_state(vk_user_id: int) -> Optional[str]:
@@ -209,6 +241,27 @@ def children_keyboard() -> VkKeyboard:
     kb.add_button("Нет детей")
     kb.add_line()
     kb.add_button("Есть дети")
+    return kb
+
+
+def denomination_keyboard() -> VkKeyboard:
+    """Клавиатура с конфессиями. VK позволяет до 5 кнопок в ряду —
+    но безопасней по 2 в ряд (длинные названия)."""
+    kb = VkKeyboard(one_time=True)
+    for i, d in enumerate(DENOMINATIONS):
+        kb.add_button(d)
+        # По 2 кнопки в ряду
+        if i % 2 == 1 and i < len(DENOMINATIONS) - 1:
+            kb.add_line()
+    kb.add_line()
+    kb.add_button("Другое")
+    return kb
+
+
+def skip_keyboard() -> VkKeyboard:
+    """Клавиатура с одной кнопкой «Пропустить» (для job)."""
+    kb = VkKeyboard(one_time=True)
+    kb.add_button("Пропустить")
     return kb
 
 
@@ -424,8 +477,49 @@ async def handle_form_city(vk_user_id: int, text: str):
         send_message(vk_user_id, "Название города от 1 до 50 символов.")
         return
     update_data(vk_user_id, city=city)
+    set_state(vk_user_id, "denomination")
+    send_message(
+        vk_user_id,
+        "Какой конфессии ты принадлежишь? Выбери из кнопок.",
+        keyboard=denomination_keyboard(),
+    )
+
+
+async def handle_form_denomination(vk_user_id: int, text: str):
+    text = text.strip()
+    if text == "Другое":
+        set_state(vk_user_id, "denomination_other")
+        send_message(
+            vk_user_id, "Напиши свою конфессию (2–50 символов).",
+            keyboard=empty_keyboard(),
+        )
+        return
+    if text not in DENOMINATIONS:
+        send_message(vk_user_id, "Выбери из кнопок.",
+                     keyboard=denomination_keyboard())
+        return
+    update_data(vk_user_id, denomination=text)
     set_state(vk_user_id, "church")
-    send_message(vk_user_id, "Какую церковь / общину посещаешь?")
+    send_message(
+        vk_user_id,
+        "Как называется твоя церковь?\n"
+        "Например: «Вифания», «Дом благодати», «Свет Спасения».",
+        keyboard=empty_keyboard(),
+    )
+
+
+async def handle_form_denomination_other(vk_user_id: int, text: str):
+    text = text.strip()
+    if not (2 <= len(text) <= 50):
+        send_message(vk_user_id, "Название конфессии от 2 до 50 символов.")
+        return
+    update_data(vk_user_id, denomination=text)
+    set_state(vk_user_id, "church")
+    send_message(
+        vk_user_id,
+        "Как называется твоя церковь?\n"
+        "Например: «Вифания», «Дом благодати», «Свет Спасения».",
+    )
 
 
 async def handle_form_church(vk_user_id: int, text: str):
@@ -434,8 +528,41 @@ async def handle_form_church(vk_user_id: int, text: str):
         send_message(vk_user_id, "Слишком короткое или длинное. От 1 до 100 символов.")
         return
     update_data(vk_user_id, church=church)
+    set_state(vk_user_id, "church_role")
+    send_message(
+        vk_user_id,
+        "Какое у тебя служение в церкви?\n"
+        "Например: «прихожанин», «диакон», «лидер молодёжи», «руководитель прославления».",
+    )
+
+
+async def handle_form_church_role(vk_user_id: int, text: str):
+    role = text.strip()
+    if not (2 <= len(role) <= 100):
+        send_message(vk_user_id, "От 2 до 100 символов.")
+        return
+    update_data(vk_user_id, church_role=role)
+    set_state(vk_user_id, "job")
+    send_message(
+        vk_user_id,
+        "Кем работаешь или на кого учишься?\n"
+        "Одной строкой. Можно пропустить.",
+        keyboard=skip_keyboard(),
+    )
+
+
+async def handle_form_job(vk_user_id: int, text: str):
+    text = text.strip()
+    if text == "Пропустить":
+        job = None
+    else:
+        if not (2 <= len(text) <= 100):
+            send_message(vk_user_id, "От 2 до 100 символов, либо «Пропустить».",
+                         keyboard=skip_keyboard())
+            return
+        job = text
+    update_data(vk_user_id, job=job)
     set_state(vk_user_id, "marital")
-    # Кнопку «Не женат / Не замужем» показываем по полу пользователя
     gender = get_data(vk_user_id).get("gender")
     send_message(vk_user_id, "Семейное положение?",
                  keyboard=marital_keyboard(gender))
@@ -601,6 +728,9 @@ async def handle_photos_done(vk_user_id: int):
             partner_age_max=data["partner_age_max"],
             city=data["city"],
             church=data["church"],
+            denomination=data.get("denomination"),
+            church_role=data.get("church_role"),
+            job=data.get("job"),
             marital=data["marital"],
             children=data["children"],
             hobbies=data["hobbies"],
@@ -703,6 +833,19 @@ async def handle_message(event):
     if lower in ("/forget", "удалить", "забыть"):
         await handle_forget(vk_user_id)
         return
+    # Команда рассылки — только для админов
+    if lower in ("rassylka", "/rassylka", "рассылка"):
+        if not vk_is_admin(vk_user_id):
+            return  # тихо игнорируем, не дразним обычных юзеров
+        await handle_rassylka_start(vk_user_id)
+        return
+    # /cancel — отмена FSM админом (в т.ч. рассылки)
+    if lower in ("/cancel", "отмена"):
+        if state and state.startswith("bc_"):
+            set_state(vk_user_id, None)
+            send_message(vk_user_id, "❌ Рассылка отменена.",
+                         keyboard=main_menu_keyboard())
+            return
 
     # Кнопки главного меню (только если не в FSM)
     if state is None:
@@ -710,6 +853,8 @@ async def handle_message(event):
             if not await require_consent(vk_user_id):
                 return
             if not await require_subscription(vk_user_id):
+                return
+            if not await require_fillin_vk(vk_user_id):
                 return
             await show_next_profile(vk_user_id)
             return
@@ -721,23 +866,36 @@ async def handle_message(event):
             if not u:
                 send_message(vk_user_id, "Анкеты ещё нет. Напиши «Начать», чтобы создать.")
                 return
-            # Покажем хотя бы текстом (фото в чате VK через бот — задача шага 5)
+            if not await require_fillin_vk(vk_user_id):
+                return
             partner = "девушки" if u["gender"] == "M" else "молодого человека"
-            text_profile = (
-                f"👤 Твоя анкета:\n\n"
-                f"{u['name']}, {u['age']}\n"
-                f"📍 {u['city']}\n"
-                f"⛪ {u['church']}\n"
-                f"💍 {u['marital']}\n"
-                f"👶 {u['children']}\n\n"
-                f"О себе:\n{u['hobbies']}\n\n"
-                f"🔎 Ищу возраст {partner}: "
+            # Текст анкеты — новые поля только если заполнены
+            profile_lines = [
+                f"👤 Твоя анкета:\n",
+                f"{u['name']}, {u['age']}",
+                f"📍 {u['city']}",
+            ]
+            if u.get("denomination"):
+                profile_lines.append(f"✝️ {u['denomination']}")
+            profile_lines.append(f"⛪ {u['church']}")
+            if u.get("church_role"):
+                profile_lines.append(f"🙏 {u['church_role']}")
+            if u.get("job"):
+                profile_lines.append(f"💼 {u['job']}")
+            profile_lines.append(f"💍 {u['marital']}")
+            profile_lines.append(f"👶 {u['children']}")
+            profile_lines.append(f"\nО себе:\n{u['hobbies']}")
+            profile_lines.append(
+                f"\n🔎 Ищу возраст {partner}: "
                 f"{u['partner_age_min']}–{u['partner_age_max']} лет"
             )
-            send_message(vk_user_id, text_profile, keyboard=main_menu_keyboard())
+            send_message(vk_user_id, "\n".join(profile_lines),
+                         keyboard=main_menu_keyboard())
             return
         if text == "💌 Мои матчи":
             if not await require_consent(vk_user_id):
+                return
+            if not await require_fillin_vk(vk_user_id):
                 return
             await show_my_matches(vk_user_id)
             return
@@ -761,8 +919,16 @@ async def handle_message(event):
         await handle_form_partner_age_max(vk_user_id, text)
     elif state == "city":
         await handle_form_city(vk_user_id, text)
+    elif state == "denomination":
+        await handle_form_denomination(vk_user_id, text)
+    elif state == "denomination_other":
+        await handle_form_denomination_other(vk_user_id, text)
     elif state == "church":
         await handle_form_church(vk_user_id, text)
+    elif state == "church_role":
+        await handle_form_church_role(vk_user_id, text)
+    elif state == "job":
+        await handle_form_job(vk_user_id, text)
     elif state == "marital":
         await handle_form_marital(vk_user_id, text)
     elif state == "children":
@@ -771,6 +937,22 @@ async def handle_message(event):
         await handle_form_hobbies(vk_user_id, text)
     elif state == "report_reason":
         await handle_report_reason_text(vk_user_id, text)
+    # Дозаполнение старых анкет
+    elif state == "legacy_denomination":
+        await handle_legacy_denomination(vk_user_id, text)
+    elif state == "legacy_denomination_other":
+        await handle_legacy_denomination_other(vk_user_id, text)
+    elif state == "legacy_church_role":
+        await handle_legacy_church_role(vk_user_id, text)
+    elif state == "legacy_job":
+        await handle_legacy_job(vk_user_id, text)
+    # Рассылка
+    elif state == "bc_text":
+        await handle_rassylka_text(vk_user_id, text)
+    elif state == "bc_age":
+        await handle_rassylka_age(vk_user_id, text)
+    elif state == "bc_city":
+        await handle_rassylka_city(vk_user_id, text)
     elif state == "photo":
         # Текст на этапе фото — подсказка
         send_message(
@@ -865,6 +1047,10 @@ async def handle_callback(event):
         action = cmd.replace("swipe_", "")
         await handle_swipe_action(vk_user_id, action)
 
+    elif cmd and cmd.startswith("bc_"):
+        # Рассылка (только админ)
+        await handle_rassylka_callback(vk_user_id, payload)
+
     # Подтверждаем нажатие, чтобы убрать «крутилку»
     try:
         vk.messages.sendMessageEventAnswer(
@@ -946,15 +1132,20 @@ def swipe_keyboard(photo_idx: int, total_photos: int) -> VkKeyboard:
 
 
 def format_profile_text(u: dict) -> str:
-    """Текст анкеты для отправки в VK (без HTML — VK его не понимает)."""
-    return (
-        f"{u['name']}, {u['age']}\n"
-        f"📍 {u['city']}\n"
-        f"⛪ {u['church']}\n"
-        f"💍 {u['marital']}\n"
-        f"👶 {u['children']}\n\n"
-        f"О себе:\n{u['hobbies']}"
-    )
+    """Текст анкеты для отправки в VK (без HTML — VK его не понимает).
+    Новые поля (denomination, church_role, job) показываются только если заполнены."""
+    lines = [f"{u['name']}, {u['age']}",
+             f"📍 {u['city']}"]
+    if u.get("denomination"):
+        lines.append(f"✝️ {u['denomination']}")
+    lines.append(f"⛪ {u['church']}")
+    if u.get("church_role"):
+        lines.append(f"🙏 {u['church_role']}")
+    if u.get("job"):
+        lines.append(f"💼 {u['job']}")
+    lines.append(f"💍 {u['marital']}")
+    lines.append(f"👶 {u['children']}")
+    return "\n".join(lines) + f"\n\nО себе:\n{u['hobbies']}"
 
 
 async def send_profile_to_vk(vk_user_id: int, profile: dict,
@@ -1077,6 +1268,516 @@ async def handle_report_reason_text(vk_user_id: int, text: str):
         keyboard=main_menu_keyboard(),
     )
     await notify_admins_about_report_vk(db_id, target_id, total, reason=reason)
+
+
+async def require_fillin_vk(vk_user_id: int) -> bool:
+    """Проверяет нужно ли пользователю VK дозаполнить новые поля.
+    Если да — запускает FSM legacy_* и возвращает False.
+    Если нет — True."""
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    if not await db.needs_legacy_fillin(db_id):
+        return True
+    set_state(vk_user_id, "legacy_denomination")
+    send_message(
+        vk_user_id,
+        "👋 У нас обновление!\n\n"
+        "Ответь на пару вопросов — это поможет другим узнать о тебе больше, "
+        "и сможешь снова листать анкеты.\n\n"
+        "Какой конфессии ты принадлежишь?",
+        keyboard=denomination_keyboard(),
+    )
+    return False
+
+
+async def handle_legacy_denomination(vk_user_id: int, text: str):
+    text = text.strip()
+    if text == "Другое":
+        set_state(vk_user_id, "legacy_denomination_other")
+        send_message(vk_user_id, "Напиши свою конфессию (2–50 символов).",
+                     keyboard=empty_keyboard())
+        return
+    if text not in DENOMINATIONS:
+        send_message(vk_user_id, "Выбери из кнопок.",
+                     keyboard=denomination_keyboard())
+        return
+    update_data(vk_user_id, legacy_denomination=text)
+    set_state(vk_user_id, "legacy_church_role")
+    send_message(
+        vk_user_id,
+        "Какое у тебя служение в церкви?\n"
+        "Например: «прихожанин», «диакон», «лидер молодёжи».",
+        keyboard=empty_keyboard(),
+    )
+
+
+async def handle_legacy_denomination_other(vk_user_id: int, text: str):
+    text = text.strip()
+    if not (2 <= len(text) <= 50):
+        send_message(vk_user_id, "Название конфессии от 2 до 50 символов.")
+        return
+    update_data(vk_user_id, legacy_denomination=text)
+    set_state(vk_user_id, "legacy_church_role")
+    send_message(
+        vk_user_id,
+        "Какое у тебя служение в церкви?\n"
+        "Например: «прихожанин», «диакон», «лидер молодёжи».",
+    )
+
+
+async def handle_legacy_church_role(vk_user_id: int, text: str):
+    role = text.strip()
+    if not (2 <= len(role) <= 100):
+        send_message(vk_user_id, "Опиши служение в 2–100 символов.")
+        return
+    update_data(vk_user_id, legacy_church_role=role)
+    set_state(vk_user_id, "legacy_job")
+    send_message(
+        vk_user_id,
+        "Кем работаешь или на кого учишься?\n"
+        "Одной строкой. Можно пропустить.",
+        keyboard=skip_keyboard(),
+    )
+
+
+async def handle_legacy_job(vk_user_id: int, text: str):
+    text = text.strip()
+    if text == "Пропустить":
+        job = None
+    else:
+        if not (2 <= len(text) <= 100):
+            send_message(vk_user_id, "От 2 до 100 символов, либо «Пропустить».",
+                         keyboard=skip_keyboard())
+            return
+        job = text
+    data = get_data(vk_user_id)
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(
+        db_id,
+        denomination=data["legacy_denomination"],
+        church_role=data["legacy_church_role"],
+        job=job,
+    )
+    set_state(vk_user_id, None)
+    send_message(
+        vk_user_id,
+        "✅ Спасибо! Анкета обновлена. Можешь дальше пользоваться ботом.",
+        keyboard=main_menu_keyboard(),
+    )
+
+
+# ============= РАССЫЛКА (команда rassylka) =============
+# В VK инлайн-меню с кнопками работает иначе чем в TG, поэтому делаем
+# проще: бот ведёт диалог пошагово через VkKeyboard (callback_button + payload).
+
+import re as _re_bc_vk
+
+
+def _bc_strip_html(text: str) -> str:
+    """Чистим HTML — VK его не понимает."""
+    if not text:
+        return text
+    text = _re_bc_vk.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=_re_bc_vk.IGNORECASE)
+    text = _re_bc_vk.sub(r"<[^>]+>", "", text)
+    text = (text.replace("&amp;", "&").replace("&lt;", "<")
+                 .replace("&gt;", ">").replace("&quot;", '"')
+                 .replace("&#39;", "'"))
+    return text
+
+
+def _bc_filter_summary(filters: dict) -> str:
+    p = filters.get("platform", "all")
+    p_label = {"all": "Все", "tg": "Только TG", "vk": "Только VK"}.get(p, "Все")
+    g = filters.get("gender", "all")
+    g_label = {"all": "Все", "M": "Только М", "F": "Только Ж"}.get(g, "Все")
+    lines = [
+        f"📱 Платформа: {p_label}",
+        f"👤 Пол: {g_label}",
+    ]
+    if filters.get("age_min") and filters.get("age_max"):
+        lines.append(f"📅 Возраст: {filters['age_min']}–{filters['age_max']}")
+    else:
+        lines.append("📅 Возраст: Все")
+    lines.append(f"📍 Город: {filters.get('city') or 'Все'}")
+    lines.append(f"✝️ Конфессия: {filters.get('denomination') or 'Все'}")
+    return "\n".join(lines)
+
+
+def _bc_main_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("👥 Всем", color=VkKeyboardColor.POSITIVE,
+                           payload={"cmd": "bc_all"})
+    kb.add_line()
+    kb.add_callback_button("⚙️ Настроить фильтры", color=VkKeyboardColor.PRIMARY,
+                           payload={"cmd": "bc_setup"})
+    kb.add_line()
+    kb.add_callback_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE,
+                           payload={"cmd": "bc_cancel"})
+    return kb
+
+
+def _bc_filter_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("📱 Платформа", payload={"cmd": "bc_f_platform"})
+    kb.add_callback_button("👤 Пол", payload={"cmd": "bc_f_gender"})
+    kb.add_line()
+    kb.add_callback_button("📅 Возраст", payload={"cmd": "bc_f_age"})
+    kb.add_callback_button("📍 Город", payload={"cmd": "bc_f_city"})
+    kb.add_line()
+    kb.add_callback_button("✝️ Конфессия", payload={"cmd": "bc_f_denom"})
+    kb.add_line()
+    kb.add_callback_button("✅ К отправке", color=VkKeyboardColor.POSITIVE,
+                           payload={"cmd": "bc_preview"})
+    kb.add_callback_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE,
+                           payload={"cmd": "bc_cancel"})
+    return kb
+
+
+def _bc_platform_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Все", payload={"cmd": "bc_set", "field": "platform", "value": "all"})
+    kb.add_line()
+    kb.add_callback_button("Только TG", payload={"cmd": "bc_set", "field": "platform", "value": "tg"})
+    kb.add_line()
+    kb.add_callback_button("Только VK", payload={"cmd": "bc_set", "field": "platform", "value": "vk"})
+    kb.add_line()
+    kb.add_callback_button("◀ Назад", payload={"cmd": "bc_back"})
+    return kb
+
+
+def _bc_gender_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Все", payload={"cmd": "bc_set", "field": "gender", "value": "all"})
+    kb.add_line()
+    kb.add_callback_button("Только мужчины", payload={"cmd": "bc_set", "field": "gender", "value": "M"})
+    kb.add_line()
+    kb.add_callback_button("Только женщины", payload={"cmd": "bc_set", "field": "gender", "value": "F"})
+    kb.add_line()
+    kb.add_callback_button("◀ Назад", payload={"cmd": "bc_back"})
+    return kb
+
+
+def _bc_denom_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    for i, d in enumerate(DENOMINATIONS):
+        kb.add_callback_button(
+            d, payload={"cmd": "bc_set", "field": "denom", "value": str(i)},
+        )
+        if i % 2 == 1 and i < len(DENOMINATIONS) - 1:
+            kb.add_line()
+    kb.add_line()
+    kb.add_callback_button("Все", payload={"cmd": "bc_set", "field": "denom", "value": "all"})
+    kb.add_line()
+    kb.add_callback_button("◀ Назад", payload={"cmd": "bc_back"})
+    return kb
+
+
+def _bc_back_kb() -> VkKeyboard:
+    """Минимальная клавиатура «Все / Назад» для age и city."""
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Все (убрать фильтр)",
+                            payload={"cmd": "bc_set", "field": "age_or_city_all"})
+    kb.add_line()
+    kb.add_callback_button("◀ Назад", payload={"cmd": "bc_back"})
+    return kb
+
+
+def _bc_confirm_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("✅ Да, отправить", color=VkKeyboardColor.POSITIVE,
+                            payload={"cmd": "bc_send"})
+    kb.add_line()
+    kb.add_callback_button("◀ К фильтрам", payload={"cmd": "bc_back_to_menu"})
+    kb.add_line()
+    kb.add_callback_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE,
+                            payload={"cmd": "bc_cancel"})
+    return kb
+
+
+async def handle_rassylka_start(vk_user_id: int):
+    """Запуск рассылки (только для админов)."""
+    set_state(vk_user_id, "bc_text", filters={}, broadcast_text=None)
+    send_message(
+        vk_user_id,
+        "📝 Рассылка\n\n"
+        "Напиши текст (5–4000 символов).\n"
+        "В VK теги HTML не отображаются (TG-получателям отправлю как есть).\n\n"
+        "Отмена: «отмена» или /cancel",
+        keyboard=empty_keyboard(),
+    )
+
+
+async def handle_rassylka_text(vk_user_id: int, text: str):
+    text = (text or "").strip()
+    if not (5 <= len(text) <= 4000):
+        send_message(vk_user_id,
+                     f"Длина {len(text)}. Допустимо: 5–4000 символов.")
+        return
+    update_data(vk_user_id, broadcast_text=text)
+    set_state(vk_user_id, None)  # выходим из bc_text — дальше через кнопки
+
+    counts = await db.count_broadcast_recipients()
+    preview = text if len(text) <= 200 else text[:200] + "…"
+    send_message(
+        vk_user_id,
+        f"📤 Кому отправить?\n\n"
+        f"Превью текста:\n{preview}\n\n"
+        f"👥 Всего получателей: {counts['total']} "
+        f"(TG: {counts['tg']}, VK: {counts['vk']})",
+        keyboard=_bc_main_kb(),
+    )
+
+
+async def _bc_show_menu(vk_user_id: int):
+    data = get_data(vk_user_id)
+    filters = data.get("filters", {})
+    counts = await db.count_broadcast_recipients(**filters)
+    send_message(
+        vk_user_id,
+        f"⚙️ Фильтры рассылки\n\n"
+        f"{_bc_filter_summary(filters)}\n\n"
+        f"👥 Подходит: {counts['total']} "
+        f"(TG: {counts['tg']}, VK: {counts['vk']})",
+        keyboard=_bc_filter_kb(),
+    )
+
+
+async def _bc_show_preview(vk_user_id: int):
+    data = get_data(vk_user_id)
+    bc_text = data.get("broadcast_text", "")
+    filters = data.get("filters", {})
+    counts = await db.count_broadcast_recipients(**filters)
+    preview = bc_text if len(bc_text) <= 300 else bc_text[:300] + "…"
+    send_message(
+        vk_user_id,
+        f"📋 Превью рассылки\n\n"
+        f"Текст:\n{preview}\n\n"
+        f"Фильтры:\n{_bc_filter_summary(filters)}\n\n"
+        f"👥 Получателей: {counts['total']} "
+        f"(TG: {counts['tg']}, VK: {counts['vk']})\n\n"
+        f"Отправить?",
+        keyboard=_bc_confirm_kb(),
+    )
+
+
+async def handle_rassylka_age(vk_user_id: int, text: str):
+    txt = (text or "").strip().replace("..", "-").replace(" ", "-")
+    m = _re_bc_vk.match(r"^(\d{2,3})-(\d{2,3})$", txt)
+    if not m:
+        send_message(vk_user_id,
+                     "Не понял. Напиши в формате 25-40 или нажми «Все».",
+                     keyboard=_bc_back_kb())
+        return
+    age_min, age_max = int(m.group(1)), int(m.group(2))
+    if not (18 <= age_min <= age_max <= 99):
+        send_message(vk_user_id, "Допустимо 18–99 и минимум ≤ максимум.")
+        return
+    data = get_data(vk_user_id)
+    filters = data.get("filters", {})
+    filters["age_min"] = age_min
+    filters["age_max"] = age_max
+    update_data(vk_user_id, filters=filters)
+    set_state(vk_user_id, None)
+    await _bc_show_menu(vk_user_id)
+
+
+async def handle_rassylka_city(vk_user_id: int, text: str):
+    city = (text or "").strip()
+    if not (2 <= len(city) <= 50):
+        send_message(vk_user_id, "Название города от 2 до 50 символов.")
+        return
+    counts = await db.count_broadcast_recipients(city=city)
+    if counts["total"] == 0:
+        send_message(vk_user_id,
+                     f"В городе «{city}» никого не нашёл. "
+                     f"Проверь название или нажми «Все».",
+                     keyboard=_bc_back_kb())
+        return
+    data = get_data(vk_user_id)
+    filters = data.get("filters", {})
+    filters["city"] = city
+    update_data(vk_user_id, filters=filters)
+    set_state(vk_user_id, None)
+    await _bc_show_menu(vk_user_id)
+
+
+async def handle_rassylka_callback(vk_user_id: int, payload: dict):
+    """Обработка кнопок рассылки (callback из inline-клавиатуры)."""
+    cmd = payload.get("cmd")
+    if not vk_is_admin(vk_user_id):
+        return
+
+    if cmd == "bc_cancel":
+        set_state(vk_user_id, None)
+        send_message(vk_user_id, "❌ Рассылка отменена.",
+                     keyboard=main_menu_keyboard())
+        return
+
+    if cmd == "bc_all":
+        # Сразу превью без фильтров
+        await _bc_show_preview(vk_user_id)
+        return
+
+    if cmd == "bc_setup":
+        await _bc_show_menu(vk_user_id)
+        return
+
+    if cmd == "bc_preview":
+        await _bc_show_preview(vk_user_id)
+        return
+
+    if cmd == "bc_back_to_menu" or cmd == "bc_back":
+        await _bc_show_menu(vk_user_id)
+        return
+
+    if cmd == "bc_f_platform":
+        send_message(vk_user_id, "📱 Платформа:", keyboard=_bc_platform_kb())
+        return
+
+    if cmd == "bc_f_gender":
+        send_message(vk_user_id, "👤 Пол:", keyboard=_bc_gender_kb())
+        return
+
+    if cmd == "bc_f_age":
+        set_state(vk_user_id, "bc_age")
+        send_message(
+            vk_user_id,
+            "📅 Возраст\n\n"
+            "Напиши диапазон, например: 25-40.\n"
+            "Или нажми «Все», чтобы убрать фильтр.",
+            keyboard=_bc_back_kb(),
+        )
+        return
+
+    if cmd == "bc_f_city":
+        set_state(vk_user_id, "bc_city")
+        cities = await db.list_distinct_cities(min_users=3)
+        cities_hint = ", ".join(cities[:15]) if cities else "(нет данных)"
+        send_message(
+            vk_user_id,
+            f"📍 Город\n\n"
+            f"Напиши название города (точное совпадение).\n\n"
+            f"Популярные: {cities_hint}\n\n"
+            f"Или нажми «Все».",
+            keyboard=_bc_back_kb(),
+        )
+        return
+
+    if cmd == "bc_f_denom":
+        send_message(vk_user_id, "✝️ Конфессия:", keyboard=_bc_denom_kb())
+        return
+
+    if cmd == "bc_set":
+        field = payload.get("field")
+        value = payload.get("value")
+        data = get_data(vk_user_id)
+        filters = data.get("filters", {})
+
+        if field == "platform":
+            filters["platform"] = value
+        elif field == "gender":
+            filters["gender"] = value
+        elif field == "denom":
+            if value == "all":
+                filters.pop("denomination", None)
+            else:
+                idx = int(value)
+                if 0 <= idx < len(DENOMINATIONS):
+                    filters["denomination"] = DENOMINATIONS[idx]
+        elif field == "age_or_city_all":
+            # Кнопка «Все» в разделе age или city
+            cur_st = get_state(vk_user_id)
+            if cur_st == "bc_age":
+                filters.pop("age_min", None)
+                filters.pop("age_max", None)
+            elif cur_st == "bc_city":
+                filters.pop("city", None)
+            set_state(vk_user_id, None)
+
+        update_data(vk_user_id, filters=filters)
+        await _bc_show_menu(vk_user_id)
+        return
+
+    if cmd == "bc_send":
+        await _bc_run(vk_user_id)
+        return
+
+
+async def _bc_run(vk_user_id: int):
+    """Запуск самой отправки от VK-админа."""
+    data = get_data(vk_user_id)
+    bc_text = data.get("broadcast_text", "")
+    filters = data.get("filters", {})
+    if not bc_text:
+        send_message(vk_user_id, "Текст пуст — отменяю.",
+                     keyboard=main_menu_keyboard())
+        set_state(vk_user_id, None)
+        return
+
+    recipients = await db.get_broadcast_recipients(**filters)
+    total = len(recipients)
+    if total == 0:
+        send_message(vk_user_id, "Никого не нашёл по фильтрам.",
+                     keyboard=main_menu_keyboard())
+        set_state(vk_user_id, None)
+        return
+
+    tg_recipients = [r for r in recipients if r["user_id"] > 0]
+    vk_recipients = [r for r in recipients if r["user_id"] < 0]
+
+    batch_id = int(__import__("time").time())
+
+    # Для TG-получателей кладём в очередь как system_message — TG-бот разошлёт
+    # Здесь мы в VK-процессе, у нас нет TG-API.
+    if tg_recipients:
+        for r in tg_recipients:
+            await db.queue_system_message(r["user_id"], bc_text)
+
+    # VK — отправляем сами, прямо здесь
+    vk_text = _bc_strip_html(bc_text)
+    set_state(vk_user_id, None)
+
+    send_message(
+        vk_user_id,
+        f"⏳ Запустил рассылку…\n"
+        f"VK: 0/{len(vk_recipients)}\n"
+        f"TG: 0/{len(tg_recipients)} (через очередь)",
+        keyboard=main_menu_keyboard(),
+    )
+
+    sent_vk = 0
+    failed_vk = 0
+    for i, r in enumerate(vk_recipients):
+        vk_uid = db.db_id_to_vk_id(r["user_id"])
+        try:
+            send_message(vk_uid, vk_text)
+            sent_vk += 1
+        except Exception as e:
+            failed_vk += 1
+            log.warning(f"Broadcast VK to {vk_uid} failed: {e}")
+        await asyncio.sleep(0.05)
+        # Прогресс каждые 50 — VK не любит частые edit, поэтому шлём новые сообщения редко
+        if (i + 1) % 100 == 0:
+            send_message(
+                vk_user_id,
+                f"⏳ Прогресс: {sent_vk + failed_vk}/{len(vk_recipients)} VK "
+                f"(✅ {sent_vk}, ❌ {failed_vk})"
+            )
+
+    send_message(
+        vk_user_id,
+        f"✅ Рассылка завершена\n\n"
+        f"ВКонтакте:\n"
+        f"• Отправлено: {sent_vk}\n"
+        f"• Не удалось: {failed_vk}\n\n"
+        f"Telegram:\n"
+        f"• В очереди: {len(tg_recipients)}\n"
+        f"• Отправит TG-бот в течение нескольких секунд.",
+        keyboard=main_menu_keyboard(),
+    )
+    log.info(
+        f"Broadcast (VK admin) batch {batch_id} done. VK sent: {sent_vk}, "
+        f"VK failed: {failed_vk}, TG queued: {len(tg_recipients)}"
+    )
 
 
 async def handle_swipe_action(vk_user_id: int, action: str):
@@ -1272,11 +1973,12 @@ async def deliver_pending_notifications_vk():
     """Раз в 3 секунды смотрим очередь pending_notifications.
     VK-бот доставляет:
       - match для VK-получателей (TG-получателей возьмёт TG-бот)
-      - system_message для VK-получателей (бан/разбан и т.п.)"""
+      - system_message для VK-получателей (бан/разбан и т.п.)
+      - broadcast для VK-получателей (рассылка от админа)"""
     while True:
         try:
             notifications = await db.get_pending_notifications(
-                kinds=("match", "system_message"),
+                kinds=("match", "system_message", "broadcast"),
             )
             for n in notifications:
                 recipient = n["recipient_id"]
@@ -1310,6 +2012,15 @@ async def deliver_pending_notifications_vk():
                         text = payload.get("text", "")
                         if text:
                             send_message(vk_uid, text)
+
+                    elif n["kind"] == "broadcast":
+                        import json
+                        payload = json.loads(n["payload"] or "{}")
+                        text = payload.get("text", "")
+                        if text:
+                            send_message(vk_uid, text)
+                        # Лимит ~20 сообщений/сек на доставку рассылок
+                        await asyncio.sleep(0.05)
 
                     await db.mark_notification_delivered(n["id"])
                 except Exception as e:

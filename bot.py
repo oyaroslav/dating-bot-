@@ -330,16 +330,52 @@ class Form(StatesGroup):
     partner_age_min = State()
     partner_age_max = State()
     city = State()
+    denomination = State()           # выбор конфессии кнопкой
+    denomination_other = State()     # если "Другое" — ввод текстом
     church = State()
+    church_role = State()            # служение в церкви
+    job = State()                    # работа/учёба (можно пропустить)
     marital = State()
     children = State()
     hobbies = State()
     photo = State()
 
 
+class LegacyFillin(StatesGroup):
+    """FSM для дозаполнения старых анкет — те, что были зарегистрированы
+    ДО введения полей denomination/church_role/job."""
+    denomination = State()
+    denomination_other = State()
+    church_role = State()
+    job = State()
+
+
 class ReportForm(StatesGroup):
     """Отдельный FSM для жалобы — пользователь нажал 🚩 и теперь пишет причину."""
     reason = State()
+
+
+class BroadcastForm(StatesGroup):
+    """FSM рассылки от админа (/rassylka).
+      text     — пишет текст рассылки
+      menu     — главное меню фильтров (или «Всем»)
+      f_age    — ввод диапазона возраста (например, 25-40)
+      f_city   — ввод города (точное название)
+      confirm  — подтверждение перед отправкой"""
+    text = State()
+    menu = State()
+    f_age = State()
+    f_city = State()
+    confirm = State()
+
+
+# ----------- Список конфессий -----------
+DENOMINATIONS = [
+    "Баптисты", "Пятидесятники", "АСД",
+    "Евангельские Христиане", "Лютеране", "Православные",
+    "Католики", "Методисты", "Пресвитериане",
+]
+# Помечаем последнюю кнопку «Другое» отдельно — она триггерит ввод текстом
 
 
 # ----------- Клавиатуры -----------
@@ -400,6 +436,27 @@ def children_kb() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="Есть, живут со мной")],
             [KeyboardButton(text="Есть, живут отдельно")],
         ],
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def denomination_kb() -> ReplyKeyboardMarkup:
+    """Клавиатура с 9 конфессиями + «Другое».
+    Раскладка 3x3 + 1 кнопка «Другое» внизу."""
+    rows = []
+    for i in range(0, len(DENOMINATIONS), 3):
+        rows.append([KeyboardButton(text=d) for d in DENOMINATIONS[i:i+3]])
+    rows.append([KeyboardButton(text="Другое")])
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True, one_time_keyboard=True,
+    )
+
+
+def skip_kb() -> ReplyKeyboardMarkup:
+    """Клавиатура с одной кнопкой «Пропустить» (используется для job)."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Пропустить")]],
         resize_keyboard=True, one_time_keyboard=True,
     )
 
@@ -656,9 +713,44 @@ async def form_city(message: Message, state: FSMContext):
         return
     await state.update_data(city=city)
     await message.answer(
-        "<b>Какую церковь посещаешь?</b>\n"
-        "Можно указать название и/или конфессию (например: «Слово жизни, г. Москва» "
-        "или «Баптистская церковь Благодать»)."
+        "<b>Какой конфессии ты принадлежишь?</b>\nВыбери из кнопок.",
+        reply_markup=denomination_kb(),
+    )
+    await state.set_state(Form.denomination)
+
+
+@router.message(Form.denomination)
+async def form_denomination(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "Другое":
+        await message.answer(
+            "Напиши свою конфессию (2–50 символов).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.set_state(Form.denomination_other)
+        return
+    if text not in DENOMINATIONS:
+        await message.answer("Выбери из кнопок.", reply_markup=denomination_kb())
+        return
+    await state.update_data(denomination=text)
+    await message.answer(
+        "<b>Как называется твоя церковь?</b>\n"
+        "Например: «Вифания», «Дом благодати», «Свет Спасения».",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.set_state(Form.church)
+
+
+@router.message(Form.denomination_other)
+async def form_denomination_other(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not (2 <= len(text) <= 50):
+        await message.answer("Название конфессии от 2 до 50 символов.")
+        return
+    await state.update_data(denomination=text)
+    await message.answer(
+        "<b>Как называется твоя церковь?</b>\n"
+        "Например: «Вифания», «Дом благодати», «Свет Спасения».",
     )
     await state.set_state(Form.church)
 
@@ -670,6 +762,42 @@ async def form_church(message: Message, state: FSMContext):
         await message.answer("Название церкви от 2 до 100 символов.")
         return
     await state.update_data(church=church)
+    await message.answer(
+        "<b>Какое у тебя служение в церкви?</b>\n"
+        "Например: «прихожанин», «диакон», «лидер молодёжи», «руководитель прославления».",
+    )
+    await state.set_state(Form.church_role)
+
+
+@router.message(Form.church_role)
+async def form_church_role(message: Message, state: FSMContext):
+    role = (message.text or "").strip()
+    if not (2 <= len(role) <= 100):
+        await message.answer("Опиши служение в 2–100 символов.")
+        return
+    await state.update_data(church_role=role)
+    await message.answer(
+        "<b>Кем работаешь или на кого учишься?</b>\n"
+        "Одной строкой. Можно пропустить.",
+        reply_markup=skip_kb(),
+    )
+    await state.set_state(Form.job)
+
+
+@router.message(Form.job)
+async def form_job(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "Пропустить":
+        job = None
+    else:
+        if not (2 <= len(text) <= 100):
+            await message.answer(
+                "От 2 до 100 символов, либо «Пропустить».",
+                reply_markup=skip_kb(),
+            )
+            return
+        job = text
+    await state.update_data(job=job)
     await message.answer("<b>Семейное положение?</b>", reply_markup=marital_kb())
     await state.set_state(Form.marital)
 
@@ -818,6 +946,9 @@ async def form_photo_done(call: CallbackQuery, state: FSMContext):
         partner_age_max=data["partner_age_max"],
         city=data["city"],
         church=data["church"],
+        denomination=data.get("denomination"),
+        church_role=data.get("church_role"),
+        job=data.get("job"),
         marital=data["marital"],
         children=data["children"],
         hobbies=data["hobbies"],
@@ -871,14 +1002,20 @@ def photo_source_from_dict(p: dict):
 
 
 def format_profile(u: dict) -> str:
-    return (
-        f"<b>{u['name']}, {u['age']}</b>\n"
-        f"📍 {u['city']}\n"
-        f"⛪ {u['church']}\n"
-        f"💍 {u['marital']}\n"
-        f"👶 {u['children']}\n\n"
-        f"<b>О себе:</b>\n{u['hobbies']}"
-    )
+    """Форматирует анкету. Новые поля (denomination, church_role, job)
+    показываются ТОЛЬКО если заполнены — у старых анкет их может не быть."""
+    lines = [f"<b>{u['name']}, {u['age']}</b>",
+             f"📍 {u['city']}"]
+    if u.get("denomination"):
+        lines.append(f"✝️ {u['denomination']}")
+    lines.append(f"⛪ {u['church']}")
+    if u.get("church_role"):
+        lines.append(f"🙏 {u['church_role']}")
+    if u.get("job"):
+        lines.append(f"💼 {u['job']}")
+    lines.append(f"💍 {u['marital']}")
+    lines.append(f"👶 {u['children']}")
+    return "\n".join(lines) + f"\n\n<b>О себе:</b>\n{u['hobbies']}"
 
 
 # ----------- Состояние просмотра в памяти -----------
@@ -1008,13 +1145,118 @@ async def report_cancel(call: CallbackQuery, state: FSMContext):
         pass
 
 
+# ----------- Дозаполнение старых анкет (legacy fill-in) -----------
+async def require_fillin(message: Message, state: FSMContext) -> bool:
+    """Проверяет, нужно ли пользователю дозаполнить новые поля анкеты
+    (denomination, church_role). Если да — запускает FSM LegacyFillin
+    и возвращает False (обработчик должен остановить выполнение).
+    Если нет — возвращает True (продолжаем как обычно).
+
+    job не требуем — он опциональный."""
+    user_id = message.from_user.id
+    if not await db.needs_legacy_fillin(user_id):
+        return True
+
+    await state.clear()
+    await state.set_state(LegacyFillin.denomination)
+    await message.answer(
+        "👋 <b>У нас обновление!</b>\n\n"
+        "Ответь на пару вопросов — это поможет другим узнать о тебе больше, "
+        "и сможешь снова листать анкеты.\n\n"
+        "<b>Какой конфессии ты принадлежишь?</b>",
+        reply_markup=denomination_kb(),
+    )
+    return False
+
+
+@router.message(LegacyFillin.denomination)
+async def legacy_form_denomination(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "Другое":
+        await message.answer(
+            "Напиши свою конфессию (2–50 символов).",
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        await state.set_state(LegacyFillin.denomination_other)
+        return
+    if text not in DENOMINATIONS:
+        await message.answer("Выбери из кнопок.", reply_markup=denomination_kb())
+        return
+    await state.update_data(denomination=text)
+    await message.answer(
+        "<b>Какое у тебя служение в церкви?</b>\n"
+        "Например: «прихожанин», «диакон», «лидер молодёжи».",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+    await state.set_state(LegacyFillin.church_role)
+
+
+@router.message(LegacyFillin.denomination_other)
+async def legacy_form_denomination_other(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if not (2 <= len(text) <= 50):
+        await message.answer("Название конфессии от 2 до 50 символов.")
+        return
+    await state.update_data(denomination=text)
+    await message.answer(
+        "<b>Какое у тебя служение в церкви?</b>\n"
+        "Например: «прихожанин», «диакон», «лидер молодёжи».",
+    )
+    await state.set_state(LegacyFillin.church_role)
+
+
+@router.message(LegacyFillin.church_role)
+async def legacy_form_church_role(message: Message, state: FSMContext):
+    role = (message.text or "").strip()
+    if not (2 <= len(role) <= 100):
+        await message.answer("Опиши служение в 2–100 символов.")
+        return
+    await state.update_data(church_role=role)
+    await message.answer(
+        "<b>Кем работаешь или на кого учишься?</b>\n"
+        "Одной строкой. Можно пропустить.",
+        reply_markup=skip_kb(),
+    )
+    await state.set_state(LegacyFillin.job)
+
+
+@router.message(LegacyFillin.job)
+async def legacy_form_job(message: Message, state: FSMContext):
+    text = (message.text or "").strip()
+    if text == "Пропустить":
+        job = None
+    else:
+        if not (2 <= len(text) <= 100):
+            await message.answer(
+                "От 2 до 100 символов, либо «Пропустить».",
+                reply_markup=skip_kb(),
+            )
+            return
+        job = text
+
+    data = await state.get_data()
+    await db.update_profile_fields(
+        message.from_user.id,
+        denomination=data["denomination"],
+        church_role=data["church_role"],
+        job=job,
+    )
+    await state.clear()
+    await message.answer(
+        "✅ Спасибо! Анкета обновлена. Можешь дальше пользоваться ботом.",
+        reply_markup=main_menu_kb(),
+    )
+
+
 @router.message(F.text == "🔍 Смотреть анкеты")
-async def browse_profiles(message: Message):
+async def browse_profiles(message: Message, state: FSMContext):
     if not await require_subscription(message):
         return
     user = await db.get_user(message.from_user.id)
     if not user:
         await message.answer("Сначала заполни анкету: /start")
+        return
+    if not await require_fillin(message, state):
         return
     await show_next_profile(message.from_user.id, message.chat.id)
 
@@ -1178,10 +1420,12 @@ async def notify_match(user_a_id: int, user_b_id: int):
 
 # ----------- Моя анкета -----------
 @router.message(F.text == "👤 Моя анкета")
-async def my_profile(message: Message):
+async def my_profile(message: Message, state: FSMContext):
     u = await db.get_user(message.from_user.id)
     if not u:
         await message.answer("Анкеты ещё нет. /start чтобы создать.")
+        return
+    if not await require_fillin(message, state):
         return
     photos = await db.get_user_photos_with_paths(message.from_user.id)
     if not photos:
@@ -1213,7 +1457,13 @@ async def my_profile(message: Message):
 
 # ----------- Список матчей -----------
 @router.message(F.text == "💌 Мои матчи")
-async def my_matches(message: Message):
+async def my_matches(message: Message, state: FSMContext):
+    user = await db.get_user(message.from_user.id)
+    if not user:
+        await message.answer("Сначала заполни анкету: /start")
+        return
+    if not await require_fillin(message, state):
+        return
     matches = await db.get_matches(message.from_user.id)
     if not matches:
         await message.answer("Пока ни одного матча. Лайкай анкеты — найдёшь!",
@@ -1506,8 +1756,11 @@ async def cmd_baninfo(message: Message):
         f"id: <code>{u['user_id']}</code>\n"
         f"@{u['username'] or '(нет username)'}\n\n"
         f"📍 {u['city']}\n"
-        f"⛪ {u['church']}\n"
-        f"💍 {u['marital']}\n"
+        + (f"✝️ {u['denomination']}\n" if u.get("denomination") else "")
+        + f"⛪ {u['church']}\n"
+        + (f"🙏 {u['church_role']}\n" if u.get("church_role") else "")
+        + (f"💼 {u['job']}\n" if u.get("job") else "")
+        + f"💍 {u['marital']}\n"
         f"👶 {u['children']}\n\n"
         f"<b>О себе:</b>\n{u['hobbies']}"
     )
@@ -1620,8 +1873,11 @@ async def cmd_userinfo(message: Message):
             username_line + "\n"
             f"<b>{u['name']}, {u['age']}</b>\n"
             f"📍 {u['city']}\n"
-            f"⛪ {u['church']}\n"
-            f"💍 {u['marital']}\n"
+            + (f"✝️ {u['denomination']}\n" if u.get("denomination") else "")
+            + f"⛪ {u['church']}\n"
+            + (f"🙏 {u['church_role']}\n" if u.get("church_role") else "")
+            + (f"💼 {u['job']}\n" if u.get("job") else "")
+            + f"💍 {u['marital']}\n"
             f"👶 {u['children']}\n"
             f"📅 Зарегистрирован: {u['created_at']}\n\n"
             f"<b>О себе:</b>\n{u['hobbies']}\n"
@@ -1731,6 +1987,511 @@ async def cmd_migrate_photos(message: Message):
         await message.answer(f"❌ Ошибка миграции: <code>{e}</code>")
 
 
+# ============= РАССЫЛКА (/rassylka) =============
+
+import re as _re_bc
+
+# Удаляет HTML-теги для VK (VK не понимает HTML)
+def _strip_html_for_vk(text: str) -> str:
+    """Грубое удаление HTML-тегов для VK."""
+    if not text:
+        return text
+    # Заменяем <br> и <br/> на перевод строки
+    text = _re_bc.sub(r"<\s*br\s*/?\s*>", "\n", text, flags=_re_bc.IGNORECASE)
+    # Удаляем все остальные теги (включая <a href="..">текст</a> — оставляем «текст»)
+    text = _re_bc.sub(r"<[^>]+>", "", text)
+    # Раскодируем HTML-сущности
+    text = (text.replace("&amp;", "&")
+                 .replace("&lt;", "<")
+                 .replace("&gt;", ">")
+                 .replace("&quot;", '"')
+                 .replace("&#39;", "'"))
+    return text
+
+
+def _filter_summary(filters: dict) -> str:
+    """Краткое описание текущих фильтров для меню."""
+    lines = []
+    # Платформа
+    p = filters.get("platform", "all")
+    p_label = {"all": "Все", "tg": "Только TG", "vk": "Только VK"}.get(p, "Все")
+    lines.append(f"📱 Платформа: <b>{p_label}</b>")
+    # Пол
+    g = filters.get("gender", "all")
+    g_label = {"all": "Все", "M": "Только М", "F": "Только Ж"}.get(g, "Все")
+    lines.append(f"👤 Пол: <b>{g_label}</b>")
+    # Возраст
+    age_min = filters.get("age_min")
+    age_max = filters.get("age_max")
+    if age_min and age_max:
+        lines.append(f"📅 Возраст: <b>{age_min}–{age_max}</b>")
+    else:
+        lines.append("📅 Возраст: <b>Все</b>")
+    # Город
+    city = filters.get("city")
+    lines.append(f"📍 Город: <b>{city or 'Все'}</b>")
+    # Конфессия
+    denom = filters.get("denomination")
+    lines.append(f"✝️ Конфессия: <b>{denom or 'Все'}</b>")
+    return "\n".join(lines)
+
+
+def _broadcast_main_menu_kb() -> InlineKeyboardMarkup:
+    """Главное меню — выбор «Всем» или «Настроить»."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Всем", callback_data="bc:all")],
+        [InlineKeyboardButton(text="⚙️ Настроить фильтры", callback_data="bc:setup")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="bc:cancel")],
+    ])
+
+
+def _broadcast_filter_menu_kb() -> InlineKeyboardMarkup:
+    """Меню настройки фильтров."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📱 Платформа", callback_data="bc:f:platform"),
+         InlineKeyboardButton(text="👤 Пол", callback_data="bc:f:gender")],
+        [InlineKeyboardButton(text="📅 Возраст", callback_data="bc:f:age"),
+         InlineKeyboardButton(text="📍 Город", callback_data="bc:f:city")],
+        [InlineKeyboardButton(text="✝️ Конфессия", callback_data="bc:f:denom")],
+        [InlineKeyboardButton(text="✅ К отправке", callback_data="bc:preview"),
+         InlineKeyboardButton(text="❌ Отмена", callback_data="bc:cancel")],
+    ])
+
+
+def _broadcast_platform_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Все", callback_data="bc:set:platform:all")],
+        [InlineKeyboardButton(text="Только TG", callback_data="bc:set:platform:tg")],
+        [InlineKeyboardButton(text="Только VK", callback_data="bc:set:platform:vk")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="bc:back")],
+    ])
+
+
+def _broadcast_gender_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Все", callback_data="bc:set:gender:all")],
+        [InlineKeyboardButton(text="Только мужчины", callback_data="bc:set:gender:M")],
+        [InlineKeyboardButton(text="Только женщины", callback_data="bc:set:gender:F")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="bc:back")],
+    ])
+
+
+def _broadcast_denom_kb() -> InlineKeyboardMarkup:
+    rows = []
+    # По 2 в ряду
+    for i in range(0, len(DENOMINATIONS), 2):
+        rows.append([
+            InlineKeyboardButton(
+                text=d,
+                callback_data=f"bc:set:denom:{i + j}",
+            )
+            for j, d in enumerate(DENOMINATIONS[i:i+2])
+        ])
+    rows.append([InlineKeyboardButton(text="Все", callback_data="bc:set:denom:all")])
+    rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="bc:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _broadcast_age_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Все", callback_data="bc:set:age:all")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="bc:back")],
+    ])
+
+
+def _broadcast_city_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Все", callback_data="bc:set:city:all")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="bc:back")],
+    ])
+
+
+def _broadcast_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, отправить", callback_data="bc:send")],
+        [InlineKeyboardButton(text="◀ К фильтрам", callback_data="bc:back_to_menu")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="bc:cancel")],
+    ])
+
+
+@router.message(Command("rassylka"))
+async def cmd_rassylka(message: Message, state: FSMContext):
+    """Запуск рассылки. Доступно только админам."""
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await state.set_state(BroadcastForm.text)
+    await message.answer(
+        "📝 <b>Рассылка</b>\n\n"
+        "Напиши текст (5–4000 символов).\n"
+        "Можно использовать HTML: <code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
+        "<code>&lt;i&gt;курсив&lt;/i&gt;</code>, "
+        "<code>&lt;a href='URL'&gt;ссылка&lt;/a&gt;</code>.\n\n"
+        "Для VK теги уберутся автоматически.\n\n"
+        "Отмена: /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(BroadcastForm.text, Command("cancel"))
+@router.message(BroadcastForm.menu, Command("cancel"))
+@router.message(BroadcastForm.f_age, Command("cancel"))
+@router.message(BroadcastForm.f_city, Command("cancel"))
+async def broadcast_cancel_cmd(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Рассылка отменена.", reply_markup=main_menu_kb())
+
+
+@router.message(BroadcastForm.text, F.text)
+async def broadcast_text(message: Message, state: FSMContext):
+    """Получили текст рассылки. Сохраняем и показываем главное меню."""
+    text = (message.text or "").strip()
+    if not (5 <= len(text) <= 4000):
+        await message.answer(
+            f"Длина текста {len(text)}. Допустимо: 5–4000 символов.",
+        )
+        return
+    await state.update_data(broadcast_text=text, filters={})
+    await state.set_state(BroadcastForm.menu)
+
+    # Считаем сколько всего получателей без фильтров
+    counts = await db.count_broadcast_recipients()
+    preview = text if len(text) <= 200 else text[:200] + "…"
+    await message.answer(
+        f"📤 <b>Кому отправить?</b>\n\n"
+        f"<i>Превью текста:</i>\n{preview}\n\n"
+        f"👥 Всего получателей: <b>{counts['total']}</b> "
+        f"(TG: {counts['tg']}, VK: {counts['vk']})",
+        reply_markup=_broadcast_main_menu_kb(),
+    )
+
+
+async def _show_filter_menu(message_or_call, state: FSMContext, edit: bool = False):
+    """Показать меню настройки фильтров с текущим состоянием."""
+    data = await state.get_data()
+    filters = data.get("filters", {})
+    counts = await db.count_broadcast_recipients(**filters)
+    text = (
+        f"⚙️ <b>Фильтры рассылки</b>\n\n"
+        f"{_filter_summary(filters)}\n\n"
+        f"👥 Подходит: <b>{counts['total']}</b> "
+        f"(TG: {counts['tg']}, VK: {counts['vk']})"
+    )
+    kb = _broadcast_filter_menu_kb()
+    if edit and isinstance(message_or_call, CallbackQuery):
+        try:
+            await message_or_call.message.edit_text(text, reply_markup=kb)
+        except Exception:
+            await message_or_call.message.answer(text, reply_markup=kb)
+    else:
+        msg = message_or_call if isinstance(message_or_call, Message) else message_or_call.message
+        await msg.answer(text, reply_markup=kb)
+
+
+async def _show_preview(call: CallbackQuery, state: FSMContext):
+    """Показать превью перед отправкой."""
+    data = await state.get_data()
+    bc_text = data.get("broadcast_text", "")
+    filters = data.get("filters", {})
+    counts = await db.count_broadcast_recipients(**filters)
+
+    preview = bc_text if len(bc_text) <= 300 else bc_text[:300] + "…"
+    text = (
+        f"📋 <b>Превью рассылки</b>\n\n"
+        f"<b>Текст:</b>\n{preview}\n\n"
+        f"<b>Фильтры:</b>\n{_filter_summary(filters)}\n\n"
+        f"👥 <b>Получателей: {counts['total']}</b> "
+        f"(TG: {counts['tg']}, VK: {counts['vk']})\n\n"
+        f"Отправить?"
+    )
+    await state.set_state(BroadcastForm.confirm)
+    try:
+        await call.message.edit_text(text, reply_markup=_broadcast_confirm_kb())
+    except Exception:
+        await call.message.answer(text, reply_markup=_broadcast_confirm_kb())
+
+
+@router.callback_query(F.data.startswith("bc:"))
+async def broadcast_callback(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        await call.answer()
+        return
+    cur_state = await state.get_state()
+    data = call.data
+
+    if data == "bc:cancel":
+        await state.clear()
+        await call.answer("Отменено")
+        try:
+            await call.message.edit_text("❌ Рассылка отменена.")
+        except Exception:
+            pass
+        return
+
+    if data == "bc:all":
+        # "Всем" — сразу превью без захода в фильтры
+        await call.answer()
+        await _show_preview(call, state)
+        return
+
+    if data == "bc:setup":
+        await call.answer()
+        await state.set_state(BroadcastForm.menu)
+        await _show_filter_menu(call, state, edit=True)
+        return
+
+    if data == "bc:preview":
+        await call.answer()
+        await _show_preview(call, state)
+        return
+
+    if data == "bc:back_to_menu":
+        await call.answer()
+        await state.set_state(BroadcastForm.menu)
+        await _show_filter_menu(call, state, edit=True)
+        return
+
+    if data == "bc:back":
+        await call.answer()
+        await state.set_state(BroadcastForm.menu)
+        await _show_filter_menu(call, state, edit=True)
+        return
+
+    # Открытие конкретного фильтра
+    if data.startswith("bc:f:"):
+        await call.answer()
+        field = data.split(":")[2]
+        if field == "platform":
+            await call.message.edit_text(
+                "📱 <b>Платформа:</b> кому отправить?",
+                reply_markup=_broadcast_platform_kb(),
+            )
+        elif field == "gender":
+            await call.message.edit_text(
+                "👤 <b>Пол:</b> кому отправить?",
+                reply_markup=_broadcast_gender_kb(),
+            )
+        elif field == "age":
+            await state.set_state(BroadcastForm.f_age)
+            await call.message.edit_text(
+                "📅 <b>Возраст</b>\n\n"
+                "Напиши диапазон в формате <code>25-40</code> "
+                "(возраст с 25 до 40 включительно).\n\n"
+                "Или нажми «Все», чтобы убрать фильтр.",
+                reply_markup=_broadcast_age_kb(),
+            )
+        elif field == "city":
+            await state.set_state(BroadcastForm.f_city)
+            cities = await db.list_distinct_cities(min_users=3)
+            cities_hint = ", ".join(cities[:15]) if cities else "(нет данных)"
+            await call.message.edit_text(
+                f"📍 <b>Город</b>\n\n"
+                f"Напиши название города (точное совпадение, без учёта регистра).\n\n"
+                f"<i>Популярные города:</i> {cities_hint}\n\n"
+                f"Или нажми «Все», чтобы убрать фильтр.",
+                reply_markup=_broadcast_city_kb(),
+            )
+        elif field == "denom":
+            await call.message.edit_text(
+                "✝️ <b>Конфессия</b>",
+                reply_markup=_broadcast_denom_kb(),
+            )
+        return
+
+    # Установка значения фильтра
+    if data.startswith("bc:set:"):
+        await call.answer()
+        parts = data.split(":")
+        # bc:set:platform:tg / bc:set:gender:M / bc:set:age:all / bc:set:denom:0 / bc:set:city:all
+        field = parts[2]
+        value = parts[3]
+        st = await state.get_data()
+        filters = st.get("filters", {})
+
+        if field == "platform":
+            filters["platform"] = value
+        elif field == "gender":
+            filters["gender"] = value
+        elif field == "age":
+            if value == "all":
+                filters.pop("age_min", None)
+                filters.pop("age_max", None)
+        elif field == "city":
+            if value == "all":
+                filters.pop("city", None)
+        elif field == "denom":
+            if value == "all":
+                filters.pop("denomination", None)
+            else:
+                idx = int(value)
+                if 0 <= idx < len(DENOMINATIONS):
+                    filters["denomination"] = DENOMINATIONS[idx]
+
+        await state.update_data(filters=filters)
+        await state.set_state(BroadcastForm.menu)
+        await _show_filter_menu(call, state, edit=True)
+        return
+
+    if data == "bc:send":
+        # Запуск рассылки
+        await call.answer("Запускаю…")
+        await _run_broadcast(call, state)
+        return
+
+
+@router.message(BroadcastForm.f_age, F.text)
+async def broadcast_age_input(message: Message, state: FSMContext):
+    """Парсим диапазон возраста: 25-40, 25 40, 25..40."""
+    txt = (message.text or "").strip().replace("..", "-").replace(" ", "-")
+    m = _re_bc.match(r"^(\d{2,3})-(\d{2,3})$", txt)
+    if not m:
+        await message.answer(
+            "Не понял. Напиши в формате <code>25-40</code> "
+            "или нажми «Все».",
+            reply_markup=_broadcast_age_kb(),
+        )
+        return
+    age_min, age_max = int(m.group(1)), int(m.group(2))
+    if not (18 <= age_min <= age_max <= 99):
+        await message.answer("Допустимо 18–99 и минимум ≤ максимум.")
+        return
+    data = await state.get_data()
+    filters = data.get("filters", {})
+    filters["age_min"] = age_min
+    filters["age_max"] = age_max
+    await state.update_data(filters=filters)
+    await state.set_state(BroadcastForm.menu)
+    await _show_filter_menu(message, state)
+
+
+@router.message(BroadcastForm.f_city, F.text)
+async def broadcast_city_input(message: Message, state: FSMContext):
+    city = (message.text or "").strip()
+    if not (2 <= len(city) <= 50):
+        await message.answer("Название города от 2 до 50 символов.")
+        return
+    # Сразу проверим, есть ли вообще кто-то в этом городе
+    counts = await db.count_broadcast_recipients(city=city)
+    if counts["total"] == 0:
+        await message.answer(
+            f"В городе «{city}» никого не нашёл. "
+            f"Проверь название (точное совпадение), либо нажми «Все».",
+            reply_markup=_broadcast_city_kb(),
+        )
+        return
+    data = await state.get_data()
+    filters = data.get("filters", {})
+    filters["city"] = city
+    await state.update_data(filters=filters)
+    await state.set_state(BroadcastForm.menu)
+    await _show_filter_menu(message, state)
+
+
+async def _run_broadcast(call: CallbackQuery, state: FSMContext):
+    """Сама отправка рассылки."""
+    data = await state.get_data()
+    bc_text = data.get("broadcast_text", "")
+    filters = data.get("filters", {})
+
+    if not bc_text:
+        await call.message.answer("Текст рассылки пуст — отменяю.")
+        await state.clear()
+        return
+
+    recipients = await db.get_broadcast_recipients(**filters)
+    total = len(recipients)
+    if total == 0:
+        await call.message.answer("Никого не нашёл по фильтрам — отменяю.")
+        await state.clear()
+        return
+
+    # Разделяем на TG и VK
+    tg_recipients = [r for r in recipients if r["user_id"] > 0]
+    vk_recipients = [r for r in recipients if r["user_id"] < 0]
+
+    # Для VK заранее кладём в очередь — VK-бот их сам разошлёт
+    batch_id = int(__import__("time").time())  # уникальный id
+    if vk_recipients:
+        vk_ids = [db.db_id_to_vk_id(r["user_id"]) for r in vk_recipients]
+        vk_text = _strip_html_for_vk(bc_text)
+        await db.queue_broadcast_chunk(vk_ids, vk_text, batch_id)
+
+    # Очищаем состояние СРАЗУ — чтобы FSM не блокировала админа во время отправки
+    await state.clear()
+
+    # Прогресс-сообщение, которое будем редактировать
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    progress_msg = await call.message.answer(
+        f"⏳ Запустил рассылку…\n"
+        f"TG: 0/{len(tg_recipients)}\n"
+        f"VK: 0/{len(vk_recipients)} (через очередь)"
+    )
+
+    # ---- Отправка в Telegram ----
+    sent_tg = 0
+    failed_tg = 0
+    blocked = 0
+    deleted = 0
+
+    for i, r in enumerate(tg_recipients):
+        try:
+            await bot.send_message(r["user_id"], bc_text)
+            sent_tg += 1
+        except Exception as e:
+            err = str(e).lower()
+            failed_tg += 1
+            if "blocked" in err or "deactivated" in err:
+                blocked += 1
+            elif "user_deactivated" in err or "chat not found" in err:
+                deleted += 1
+            logging.warning(f"Broadcast TG to {r['user_id']} failed: {e}")
+        # Лимит ≈20 сообщений/сек
+        await asyncio.sleep(0.05)
+        # Обновляем прогресс каждые 25 (чтобы не упереться в rate limit edit'ов)
+        if (i + 1) % 25 == 0:
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ Рассылка в процессе…\n"
+                    f"TG: {sent_tg + failed_tg}/{len(tg_recipients)} "
+                    f"(✅ {sent_tg}, ❌ {failed_tg})\n"
+                    f"VK: в очереди ({len(vk_recipients)} запланировано)"
+                )
+            except Exception:
+                pass
+
+    # ---- VK-статистика (запросим разок, не ждём завершения) ----
+    vk_stats_now = await db.get_broadcast_stats(batch_id) if vk_recipients else {"delivered": 0, "pending": 0}
+
+    # ---- Финал ----
+    try:
+        await progress_msg.edit_text(
+            f"✅ <b>Рассылка завершена</b>\n\n"
+            f"<b>Telegram:</b>\n"
+            f"• Отправлено: {sent_tg}\n"
+            f"• Не удалось: {failed_tg}"
+            + (f" (заблокировали бота: {blocked})" if blocked else "")
+            + (f" (удалили аккаунт: {deleted})" if deleted else "")
+            + "\n\n"
+            + f"<b>ВКонтакте:</b>\n"
+            + f"• В очереди: {len(vk_recipients)}\n"
+            + f"• Уже отправлено: {vk_stats_now['delivered']}\n"
+            + f"• Ждут отправки: {vk_stats_now['pending']}\n\n"
+            + f"<i>VK-рассылка идёт фоном (~20 сообщений/сек). "
+              f"Проверь через несколько минут.</i>"
+        )
+    except Exception:
+        pass
+
+    logging.info(
+        f"Broadcast batch {batch_id} done. TG sent: {sent_tg}, "
+        f"TG failed: {failed_tg}, VK queued: {len(vk_recipients)}"
+    )
+
+
 # ----------- Фоновая задача: доставка кросс-платформенных уведомлений -----------
 async def deliver_pending_notifications():
     """Раз в 3 секунды смотрим в очередь pending_notifications.
@@ -1796,6 +2557,23 @@ async def deliver_pending_notifications():
                                 logging.warning(
                                     f"system_message TG to {recipient} failed: {e}"
                                 )
+                        await db.mark_notification_delivered(n["id"])
+
+                    elif n["kind"] == "broadcast":
+                        recipient = n["recipient_id"]
+                        if recipient is None or not db.is_tg_user(recipient):
+                            continue
+                        import json
+                        payload = json.loads(n["payload"] or "{}")
+                        text = payload.get("text", "")
+                        if text:
+                            try:
+                                await bot.send_message(recipient, text)
+                            except Exception as e:
+                                logging.warning(
+                                    f"broadcast TG to {recipient} failed: {e}"
+                                )
+                        await asyncio.sleep(0.05)  # лимит ~20/сек
                         await db.mark_notification_delivered(n["id"])
                 except Exception as e:
                     logging.exception(f"Доставка уведомления {n['id']} упала: {e}")
