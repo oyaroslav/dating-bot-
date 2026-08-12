@@ -98,6 +98,18 @@ async def init_db():
                 version     TEXT NOT NULL DEFAULT 'v1'
             );
 
+            -- Динамическая ролевая модель.
+            -- Root-админы задаются через .env (ADMIN_IDS / VK_ADMIN_IDS)
+            -- и в эту таблицу НЕ попадают.
+            -- Здесь только admin и moderator, назначенные через бота.
+            -- user_id может быть как TG (положительный), так и VK (отрицательный).
+            CREATE TABLE IF NOT EXISTS admins (
+                user_id      INTEGER PRIMARY KEY,
+                role         TEXT NOT NULL,         -- 'admin' | 'moderator'
+                assigned_by  INTEGER NOT NULL,      -- кто назначил (для истории)
+                assigned_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
             -- Очередь уведомлений для кросс-платформенной доставки.
             -- VK-бот не может слать в Telegram напрямую, поэтому кладёт сюда.
             -- TG-бот раз в несколько секунд читает и доставляет.
@@ -183,6 +195,29 @@ async def init_db():
         if "job" not in existing_cols:
             await conn.execute(
                 "ALTER TABLE users ADD COLUMN job TEXT"
+            )
+
+        # Скрытая анкета (юзер поставил на паузу).
+        # is_hidden = 1 — не показывать анкету другим, не пускать листать самому.
+        if "is_hidden" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN is_hidden INTEGER NOT NULL DEFAULT 0"
+            )
+        # Когда скрыл — чтобы через 30 дней спросить «вернуть?»
+        if "hidden_at" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN hidden_at TIMESTAMP"
+            )
+        # Когда последний раз отправляли еженедельное уведомление —
+        # чтобы не отправлять дважды за одну субботу
+        if "last_weekly_notif" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN last_weekly_notif TIMESTAMP"
+            )
+        # Когда последний раз отправляли итог лайков — чтобы не дублировать
+        if "last_daily_likes_notif" not in existing_cols:
+            await conn.execute(
+                "ALTER TABLE users ADD COLUMN last_daily_likes_notif TIMESTAMP"
             )
 
         await conn.commit()
@@ -322,8 +357,12 @@ async def get_next_profile(user_id: int):
       - попадает в МОЙ диапазон возраста (partner_age_min..partner_age_max)
         — ЭТО ОДНОСТОРОННИЙ фильтр: только мой выбор. Каждый сам решает,
         кого видеть, поэтому НЕ требуем, чтобы я попадал в их диапазон.
-      - я ещё не свайпал
+      - я ещё не свайпал (или свайпнул давно — см. ниже)
       - не забанен
+      - НЕ скрыл свою анкету
+
+    Про восстановление пропущенных: если я поставил ❌ более 30 дней назад,
+    эта анкета снова появится в ленте. Лайки НЕ восстанавливаем — они однократны.
     """
     me = await get_user(user_id)
     if not me:
@@ -338,20 +377,26 @@ async def get_next_profile(user_id: int):
 
         # Логика подбора:
         #   - анкета не моя
-        #   - противоположный пол (двусторонний фильтр по полу)
-        #   - я ещё не свайпал
+        #   - противоположный пол
+        #   - у неё НЕ включён режим "скрыть"
+        #   - я не свайпал ЛИБО свайпнул дизлайк старше 30 дней
         #   - не забанен
         #   - И ОДНО ИЗ:
-        #       а) попадает в МОЙ диапазон возраста
-        #       б) этот человек уже меня лайкнул — тогда показать,
-        #          даже если он вне моего диапазона
+        #       а) попадает в мой диапазон возраста
+        #       б) уже меня лайкнула — тогда показать вне зависимости от возраста
         sql = """
             SELECT u.* FROM users u
             WHERE u.user_id != ?
               AND u.gender = ?
               AND u.looking_for = ?
+              AND COALESCE(u.is_hidden, 0) = 0
               AND u.user_id NOT IN (
-                  SELECT to_user FROM swipes WHERE from_user = ?
+                  SELECT to_user FROM swipes
+                  WHERE from_user = ?
+                    AND (
+                        action = 'like'
+                        OR datetime(created_at) > datetime('now', '-30 days')
+                    )
               )
               AND u.user_id NOT IN (SELECT user_id FROM banned)
               AND (
@@ -1251,3 +1296,238 @@ async def get_broadcast_stats(batch_id: int) -> dict:
             else:
                 result["pending"] = count
         return result
+
+
+# ============= СКРЫТИЕ АНКЕТЫ («Скрыть меня») =============
+
+async def is_hidden(user_id: int) -> bool:
+    """Скрыта ли анкета этим юзером."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT COALESCE(is_hidden, 0) FROM users WHERE user_id = ?",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        return bool(row and row[0])
+
+
+async def hide_user(user_id: int):
+    """Скрывает анкету — она не показывается другим и не пускает листать."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE users SET is_hidden = 1, hidden_at = CURRENT_TIMESTAMP "
+            "WHERE user_id = ?",
+            (user_id,),
+        )
+        await conn.commit()
+
+
+async def unhide_user(user_id: int):
+    """Возвращает анкету в ленту."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE users SET is_hidden = 0, hidden_at = NULL "
+            "WHERE user_id = ?",
+            (user_id,),
+        )
+        await conn.commit()
+
+
+async def extend_hide(user_id: int):
+    """Продлить скрытие ещё на 30 дней — сбрасываем hidden_at на сейчас."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute(
+            "UPDATE users SET hidden_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+            (user_id,),
+        )
+        await conn.commit()
+
+
+async def get_users_hidden_30_days() -> list[dict]:
+    """Юзеры, у которых скрытие ≥ 30 дней и мы им ещё не отправляли напоминание.
+    Возвращаем всех подходящих — напоминание шлётся раз, поскольку после
+    extend_hide() поле hidden_at обновится и таймер начнётся заново."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("""
+            SELECT user_id, name, hidden_at FROM users
+            WHERE is_hidden = 1
+              AND hidden_at IS NOT NULL
+              AND datetime(hidden_at) < datetime('now', '-30 days')
+        """)
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+# ============= ИТОГ ЛАЙКОВ ЗА ДЕНЬ =============
+
+async def get_daily_likes_recipients() -> list[dict]:
+    """Возвращает список тех, кому нужно отправить итог лайков.
+    Условия:
+      - за последние 24 часа получил ≥ 1 лайк
+      - анкета не скрыта, не забанен
+      - последнее отправленное «итог лайков» уведомление было > 20 часов назад
+        (чтобы не задваивать, если бот перезапустился)
+
+    Каждая запись: {user_id, name, likes_count}."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("""
+            SELECT u.user_id, u.name, COUNT(s.from_user) AS likes_count
+            FROM users u
+            JOIN swipes s ON s.to_user = u.user_id
+                          AND s.action = 'like'
+                          AND datetime(s.created_at) > datetime('now', '-24 hours')
+            WHERE COALESCE(u.is_hidden, 0) = 0
+              AND u.user_id NOT IN (SELECT user_id FROM banned)
+              AND (
+                  u.last_daily_likes_notif IS NULL
+                  OR datetime(u.last_daily_likes_notif) < datetime('now', '-20 hours')
+              )
+              -- отправляем только тем от кого лайк пришёл после последнего уведомления
+              AND (
+                  u.last_daily_likes_notif IS NULL
+                  OR datetime(s.created_at) > datetime(u.last_daily_likes_notif)
+              )
+            GROUP BY u.user_id
+            HAVING likes_count > 0
+        """)
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def mark_daily_likes_notified(user_ids: list[int]):
+    """Отмечаем что этим юзерам мы уже отправили итог."""
+    if not user_ids:
+        return
+    async with aiosqlite.connect(DB_PATH) as conn:
+        placeholders = ",".join("?" for _ in user_ids)
+        await conn.execute(
+            f"UPDATE users SET last_daily_likes_notif = CURRENT_TIMESTAMP "
+            f"WHERE user_id IN ({placeholders})",
+            user_ids,
+        )
+        await conn.commit()
+
+
+# ============= ЕЖЕНЕДЕЛЬНОЕ УВЕДОМЛЕНИЕ О НОВЫХ АНКЕТАХ =============
+
+async def get_weekly_notif_recipients() -> list[dict]:
+    """Считает для каждого активного юзера, сколько новых анкет
+    противоположного пола появилось за неделю в его возрастном диапазоне.
+
+    Возвращаем только тех, у кого фактически ≥ 1 новая анкета."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("""
+            SELECT u.user_id, u.name, u.gender,
+                   COALESCE(u.partner_age_min, 18) AS a_min,
+                   COALESCE(u.partner_age_max, 99) AS a_max,
+                   (
+                     SELECT COUNT(*) FROM users n
+                     WHERE n.gender = u.looking_for
+                       AND n.looking_for = u.gender
+                       AND n.age BETWEEN COALESCE(u.partner_age_min, 18)
+                                     AND COALESCE(u.partner_age_max, 99)
+                       AND COALESCE(n.is_hidden, 0) = 0
+                       AND n.user_id NOT IN (SELECT user_id FROM banned)
+                       AND datetime(n.created_at) > datetime('now', '-7 days')
+                       AND n.user_id != u.user_id
+                   ) AS new_count
+            FROM users u
+            WHERE COALESCE(u.is_hidden, 0) = 0
+              AND u.user_id NOT IN (SELECT user_id FROM banned)
+              -- не отправляли в этот раз (в этот вызов):
+              AND (
+                  u.last_weekly_notif IS NULL
+                  OR datetime(u.last_weekly_notif) < datetime('now', '-5 days')
+              )
+        """)
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows if r["new_count"] > 0]
+
+
+async def mark_weekly_notified(user_ids: list[int]):
+    if not user_ids:
+        return
+    async with aiosqlite.connect(DB_PATH) as conn:
+        placeholders = ",".join("?" for _ in user_ids)
+        await conn.execute(
+            f"UPDATE users SET last_weekly_notif = CURRENT_TIMESTAMP "
+            f"WHERE user_id IN ({placeholders})",
+            user_ids,
+        )
+        await conn.commit()
+
+
+# ============= РОЛЕВАЯ МОДЕЛЬ (admin / moderator) =============
+# Root-админы — из .env, в этой таблице их нет.
+# Все проверки прав в боте склеивают ".env-роот" + "запись в admins".
+
+async def get_role(user_id: int) -> str | None:
+    """Возвращает роль юзера из таблицы admins: 'admin' | 'moderator' | None.
+    NB: root-статус (из .env) здесь НЕ учитывается — его проверяет сам бот."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT role FROM admins WHERE user_id = ?", (user_id,)
+        )
+        row = await cur.fetchone()
+        return row[0] if row else None
+
+
+async def set_role(user_id: int, role: str, assigned_by: int):
+    """Назначить роль (создать или перезаписать). role: 'admin' | 'moderator'."""
+    if role not in ("admin", "moderator"):
+        raise ValueError(f"Недопустимая роль: {role}")
+    async with aiosqlite.connect(DB_PATH) as conn:
+        await conn.execute("""
+            INSERT INTO admins (user_id, role, assigned_by) VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                role = excluded.role,
+                assigned_by = excluded.assigned_by,
+                assigned_at = CURRENT_TIMESTAMP
+        """, (user_id, role, assigned_by))
+        await conn.commit()
+
+
+async def remove_role(user_id: int) -> bool:
+    """Разжаловать (удалить запись). Возвращает True если запись была."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "DELETE FROM admins WHERE user_id = ?", (user_id,)
+        )
+        await conn.commit()
+        return cur.rowcount > 0
+
+
+async def list_admins_by_role(role: str) -> list[dict]:
+    """Список юзеров с указанной ролью, с их именами (из users, если есть)."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        cur = await conn.execute("""
+            SELECT a.user_id, a.role, a.assigned_at, a.assigned_by,
+                   u.name, u.username
+            FROM admins a
+            LEFT JOIN users u ON u.user_id = a.user_id
+            WHERE a.role = ?
+            ORDER BY a.assigned_at DESC
+        """, (role,))
+        return [dict(r) for r in await cur.fetchall()]
+
+
+async def get_all_admin_ids() -> set[int]:
+    """Все user_id с ролью admin (для быстрой проверки в боте)."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT user_id FROM admins WHERE role = 'admin'"
+        )
+        return {r[0] for r in await cur.fetchall()}
+
+
+async def get_all_moderator_ids() -> set[int]:
+    """Все user_id с ролью moderator."""
+    async with aiosqlite.connect(DB_PATH) as conn:
+        cur = await conn.execute(
+            "SELECT user_id FROM admins WHERE role = 'moderator'"
+        )
+        return {r[0] for r in await cur.fetchall()}

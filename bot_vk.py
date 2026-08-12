@@ -51,8 +51,35 @@ if not VK_TOKEN or not VK_GROUP_ID:
 VK_GROUP_ID_INT = int(VK_GROUP_ID)
 
 
-def vk_is_admin(vk_user_id: int) -> bool:
+def vk_is_root(vk_user_id: int) -> bool:
+    """Root — VK-админ из .env (VK_ADMIN_IDS). Разжаловать нельзя."""
     return vk_user_id in VK_ADMIN_IDS
+
+
+async def vk_is_admin(vk_user_id: int) -> bool:
+    """Root или admin в общей таблице admins."""
+    if vk_user_id in VK_ADMIN_IDS:
+        return True
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    role = await db.get_role(db_id)
+    return role == "admin"
+
+
+async def vk_is_moderator(vk_user_id: int) -> bool:
+    """Root, admin или moderator — любой уровень."""
+    if vk_user_id in VK_ADMIN_IDS:
+        return True
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    role = await db.get_role(db_id)
+    return role in ("admin", "moderator")
+
+
+async def vk_get_level(vk_user_id: int) -> str | None:
+    """'root' | 'admin' | 'moderator' | None"""
+    if vk_user_id in VK_ADMIN_IDS:
+        return "root"
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    return await db.get_role(db_id)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -123,6 +150,8 @@ STATES = (
     "report_reason",
     # Рассылка (только для админов):
     "bc_text", "bc_age", "bc_city",
+    # Назначение роли (админ вводит ID):
+    "assign_role_target",
 )
 
 
@@ -202,6 +231,7 @@ def send_long(vk_user_id: int, text: str, keyboard=None):
 
 # ----------- Клавиатуры -----------
 def main_menu_keyboard() -> VkKeyboard:
+    """Обычное меню для всех юзеров."""
     kb = VkKeyboard(one_time=False)
     kb.add_button("🔍 Смотреть анкеты", color=VkKeyboardColor.PRIMARY)
     kb.add_line()
@@ -209,6 +239,55 @@ def main_menu_keyboard() -> VkKeyboard:
     kb.add_button("💌 Мои матчи")
     kb.add_line()
     kb.add_button("✏️ Заполнить заново", color=VkKeyboardColor.SECONDARY)
+    kb.add_button("⚙️ Настройки", color=VkKeyboardColor.SECONDARY)
+    return kb
+
+
+def main_menu_admin_keyboard() -> VkKeyboard:
+    """Меню админа (root/admin/moderator) — с кнопкой «👑 Админ»."""
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("🔍 Смотреть анкеты", color=VkKeyboardColor.PRIMARY)
+    kb.add_line()
+    kb.add_button("👤 Моя анкета")
+    kb.add_button("💌 Мои матчи")
+    kb.add_line()
+    kb.add_button("✏️ Заполнить заново", color=VkKeyboardColor.SECONDARY)
+    kb.add_button("⚙️ Настройки", color=VkKeyboardColor.SECONDARY)
+    kb.add_line()
+    kb.add_button("👑 Админ", color=VkKeyboardColor.NEGATIVE)
+    return kb
+
+
+async def menu_for_vk(vk_user_id: int) -> VkKeyboard:
+    """Возвращает подходящее меню — админское или обычное."""
+    if await vk_is_moderator(vk_user_id):
+        return main_menu_admin_keyboard()
+    return main_menu_keyboard()
+
+
+def hidden_menu_keyboard() -> VkKeyboard:
+    """Меню для скрытых юзеров — только одна кнопка."""
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("🙋 Вернуть анкету", color=VkKeyboardColor.POSITIVE)
+    return kb
+
+
+def settings_kb_vk() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("👁 Скрыть мою анкету", color=VkKeyboardColor.SECONDARY,
+                            payload={"cmd": "settings_hide"})
+    kb.add_line()
+    kb.add_callback_button("◀ Назад", payload={"cmd": "settings_back"})
+    return kb
+
+
+def hide_confirm_kb_vk() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("✅ Да, скрыть", color=VkKeyboardColor.POSITIVE,
+                            payload={"cmd": "settings_hide_confirm"})
+    kb.add_line()
+    kb.add_callback_button("❌ Отмена", color=VkKeyboardColor.NEGATIVE,
+                            payload={"cmd": "settings_back"})
     return kb
 
 
@@ -754,7 +833,7 @@ async def handle_photos_done(vk_user_id: int):
         vk_user_id,
         f"✅ Анкета сохранена! Загружено фото: {len(photos)}.{extra}\n\n"
         "Просмотр анкет в ВК будет добавлен в следующем обновлении бота.",
-        keyboard=main_menu_keyboard(),
+        keyboard=await menu_for_vk(vk_user_id),
     )
 
 
@@ -773,7 +852,7 @@ async def handle_start(vk_user_id: int):
         send_message(
             vk_user_id,
             f"С возвращением, {user['name']}! Что будем делать?",
-            keyboard=main_menu_keyboard(),
+            keyboard=await menu_for_vk(vk_user_id),
         )
     else:
         send_message(
@@ -831,12 +910,32 @@ async def handle_message(event):
         send_long(vk_user_id, USER_AGREEMENT_TEXT)
         return
     if lower in ("/forget", "удалить", "забыть"):
+        # Специальный кейс — если юзер скрыт и на предложение бота ответил
+        # «удалить», удаляем безоговорочно (с подтверждением).
+        u_check = await db.get_user(db.vk_id_to_db_id(vk_user_id))
+        if u_check and u_check.get("is_hidden"):
+            await handle_forget(vk_user_id)
+            return
         await handle_forget(vk_user_id)
         return
-    # Команда рассылки — только для админов
+
+    # Юзер скрыл анкету и в ответ на напоминание пишет «вернуть»
+    if lower in ("вернуть", "вернуть анкету"):
+        db_id = db.vk_id_to_db_id(vk_user_id)
+        u_check = await db.get_user(db_id)
+        if u_check and u_check.get("is_hidden"):
+            await db.unhide_user(db_id)
+            send_message(
+                vk_user_id,
+                "🙋 Отлично! Твоя анкета снова в ленте.",
+                keyboard=main_menu_keyboard(),
+            )
+            return
+
+    # Команда рассылки — только для root-админов
     if lower in ("rassylka", "/rassylka", "рассылка"):
-        if not vk_is_admin(vk_user_id):
-            return  # тихо игнорируем, не дразним обычных юзеров
+        if not vk_is_root(vk_user_id):
+            return  # тихо игнорируем
         await handle_rassylka_start(vk_user_id)
         return
     # /cancel — отмена FSM админом (в т.ч. рассылки)
@@ -854,9 +953,72 @@ async def handle_message(event):
                 return
             if not await require_subscription(vk_user_id):
                 return
+            # Проверка скрытия
+            db_id = db.vk_id_to_db_id(vk_user_id)
+            me = await db.get_user(db_id)
+            if me and me.get("is_hidden"):
+                send_message(
+                    vk_user_id,
+                    "Твоя анкета скрыта — сначала верни её, "
+                    "чтобы листать других.",
+                    keyboard=hidden_menu_keyboard(),
+                )
+                return
             if not await require_fillin_vk(vk_user_id):
                 return
             await show_next_profile(vk_user_id)
+            return
+
+        if text == "🙋 Вернуть анкету":
+            db_id = db.vk_id_to_db_id(vk_user_id)
+            u_check = await db.get_user(db_id)
+            if u_check and u_check.get("is_hidden"):
+                await db.unhide_user(db_id)
+                send_message(vk_user_id,
+                             "🙋 Отлично! Твоя анкета снова в ленте.",
+                             keyboard=main_menu_keyboard())
+            else:
+                send_message(vk_user_id, "Твоя анкета уже активна.",
+                             keyboard=main_menu_keyboard())
+            return
+
+        if text == "⚙️ Настройки":
+            if not await require_consent(vk_user_id):
+                return
+            db_id = db.vk_id_to_db_id(vk_user_id)
+            u_check = await db.get_user(db_id)
+            if not u_check:
+                send_message(vk_user_id, "Сначала заполни анкету. Напиши «Начать».")
+                return
+            if u_check.get("is_hidden"):
+                send_message(vk_user_id,
+                             "Твоя анкета скрыта. Нажми «🙋 Вернуть анкету», "
+                             "чтобы снова листать ленту.",
+                             keyboard=hidden_menu_keyboard())
+                return
+            send_message(
+                vk_user_id,
+                "⚙️ Настройки\n\n"
+                "Здесь можно временно скрыть свою анкету — она перестанет "
+                "показываться другим, но все свайпы, лайки и матчи сохранятся.",
+                keyboard=settings_kb_vk(),
+            )
+            return
+
+        if text == "👑 Админ":
+            # Меню админа — доступно если есть роль
+            if not await vk_is_moderator(vk_user_id):
+                return  # тихо — у обычных юзеров этой кнопки быть не должно
+            level = await vk_get_level(vk_user_id)
+            level_label = {"root": "🔴 Root", "admin": "🟠 Админ",
+                           "moderator": "🟡 Модератор"}[level]
+            send_message(
+                vk_user_id,
+                f"👑 Админ-меню\n"
+                f"Твоя роль: {level_label}\n\n"
+                f"Выбери действие:",
+                keyboard=await _vk_admin_menu_kb(vk_user_id),
+            )
             return
         if text == "👤 Моя анкета":
             if not await require_consent(vk_user_id):
@@ -953,6 +1115,8 @@ async def handle_message(event):
         await handle_rassylka_age(vk_user_id, text)
     elif state == "bc_city":
         await handle_rassylka_city(vk_user_id, text)
+    elif state == "assign_role_target":
+        await handle_vk_assign_target(vk_user_id, text)
     elif state == "photo":
         # Текст на этапе фото — подсказка
         send_message(
@@ -1048,8 +1212,40 @@ async def handle_callback(event):
         await handle_swipe_action(vk_user_id, action)
 
     elif cmd and cmd.startswith("bc_"):
-        # Рассылка (только админ)
+        # Рассылка (только root)
         await handle_rassylka_callback(vk_user_id, payload)
+
+    elif cmd and cmd.startswith("vadm_"):
+        # Админ-меню VK
+        await handle_vk_admin_callback(vk_user_id, payload)
+
+    elif cmd == "settings_back":
+        # Просто игнорируем — inline-кнопка "Назад"
+        pass
+
+    elif cmd == "settings_hide":
+        send_message(
+            vk_user_id,
+            "👁 Скрыть анкету?\n\n"
+            "• Твою анкету перестанут показывать другим\n"
+            "• Ты не сможешь листать анкеты, пока не вернёшь свою\n"
+            "• Все свайпы, лайки и матчи сохранятся\n"
+            "• Через 30 дней бот сам напомнит: вернуть или удалить\n"
+            "• Ты можешь вернуть анкету в любой момент "
+            "кнопкой в меню",
+            keyboard=hide_confirm_kb_vk(),
+        )
+
+    elif cmd == "settings_hide_confirm":
+        db_id = db.vk_id_to_db_id(vk_user_id)
+        await db.hide_user(db_id)
+        send_message(
+            vk_user_id,
+            "✅ Твоя анкета скрыта. Через 30 дней я напомню — "
+            "вернуть или окончательно удалить.\n\n"
+            "Если передумаешь раньше — жми «🙋 Вернуть анкету».",
+            keyboard=hidden_menu_keyboard(),
+        )
 
     # Подтверждаем нажатие, чтобы убрать «крутилку»
     try:
@@ -1603,7 +1799,7 @@ async def handle_rassylka_city(vk_user_id: int, text: str):
 async def handle_rassylka_callback(vk_user_id: int, payload: dict):
     """Обработка кнопок рассылки (callback из inline-клавиатуры)."""
     cmd = payload.get("cmd")
-    if not vk_is_admin(vk_user_id):
+    if not vk_is_root(vk_user_id):
         return
 
     if cmd == "bc_cancel":
@@ -1958,7 +2154,10 @@ async def show_my_matches(vk_user_id: int):
         return
     send_message(vk_user_id, f"💌 Твои матчи ({len(matches)}):")
     for m in matches:
-        text = (f"{m['name']}, {m['age']}\n"
+        # Иконка платформы — чтобы юзер понимал, откуда контакт
+        icon = "🌐" if db.is_vk_user(m["user_id"]) else "📱"
+        name = m.get("name") or "Без имени"
+        text = (f"{icon} {name}, {m['age']}\n"
                 f"📍 {m['city']}\n"
                 f"Контакт: {db.contact_link(m)}")
         # Фото обложки — если есть локальный файл
@@ -1967,6 +2166,293 @@ async def show_my_matches(vk_user_id: int):
             attachment = upload_photo_to_messages(m["photo_path"], vk_user_id)
         send_message(vk_user_id, text, attachment=attachment)
 
+
+
+# ============= АДМИН-МЕНЮ VK («👑 Админ») =============
+# Аналог TG-версии: подменю с inline-кнопками. Наполнение зависит от роли.
+
+async def _vk_admin_menu_kb(vk_user_id: int) -> VkKeyboard:
+    """Клавиатура админ-меню для конкретного VK-юзера — по его роли."""
+    level = await vk_get_level(vk_user_id)
+    kb = VkKeyboard(inline=True)
+
+    kb.add_callback_button("📊 Статистика", color=VkKeyboardColor.PRIMARY,
+                            payload={"cmd": "vadm_stats"})
+    kb.add_line()
+
+    if level == "root":
+        kb.add_callback_button("📢 Рассылка", color=VkKeyboardColor.POSITIVE,
+                                payload={"cmd": "vadm_broadcast"})
+        kb.add_line()
+        kb.add_callback_button("👑 Назначить админа",
+                                payload={"cmd": "vadm_assign", "role": "admin"})
+        kb.add_line()
+        kb.add_callback_button("🛡 Назначить модератора",
+                                payload={"cmd": "vadm_assign", "role": "moderator"})
+        kb.add_line()
+        kb.add_callback_button("📋 Список админов",
+                                payload={"cmd": "vadm_list", "role": "admin"})
+        kb.add_line()
+        kb.add_callback_button("📋 Список модераторов",
+                                payload={"cmd": "vadm_list", "role": "moderator"})
+    elif level == "admin":
+        kb.add_callback_button("🛡 Назначить модератора",
+                                payload={"cmd": "vadm_assign", "role": "moderator"})
+        kb.add_line()
+        kb.add_callback_button("📋 Список модераторов",
+                                payload={"cmd": "vadm_list", "role": "moderator"})
+    # Модератору — только статистика.
+
+    return kb
+
+
+async def _vk_show_stats(vk_user_id: int):
+    """Аналог /stats для VK — та же функция из БД."""
+    s = await db.get_stats()
+
+    def fmt_top(items: list) -> str:
+        if not items:
+            return "  (нет данных)"
+        return "\n".join(f"  {i+1}. {name} — {cnt}"
+                         for i, (name, cnt) in enumerate(items))
+
+    text = (
+        "📊 Статистика бота\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "👥 Пользователи\n"
+        f"  Всего: {s['users_total']}\n"
+        f"  ├ М: {s['users_male']}\n"
+        f"  └ Ж: {s['users_female']}\n"
+        f"  Новых за 24ч: +{s['users_24h']}\n"
+        f"  За 7 дней: +{s['users_7d']}\n"
+        f"  За 30 дней: +{s['users_30d']}\n"
+        f"  Активных 7 дней: {s['users_active_7d']}\n\n"
+        "💫 Активность\n"
+        f"  Свайпов: {s['swipes_total']}\n"
+        f"  ├ ❤️ {s['likes_total']}\n"
+        f"  └ ❌ {s['dislikes_total']}\n"
+        f"  Конверсия: {s['like_rate']}%\n"
+        f"  За 24ч: {s['swipes_24h']}\n\n"
+        "💕 Матчи\n"
+        f"  Всего: {s['matches_total']}\n"
+        f"  За 24ч: +{s['matches_24h']}\n"
+        f"  За 7 дней: +{s['matches_7d']}\n\n"
+        f"🏙 Топ городов\n{fmt_top(s['top_cities'])}\n\n"
+        f"⛪ Топ церквей\n{fmt_top(s['top_churches'])}\n\n"
+        "🛡 Модерация\n"
+        f"  Жалоб: {s['reports_total']}\n"
+        f"  За 24ч: {s['reports_24h']}\n"
+        f"  Забанено: {s['banned_total']}"
+    )
+    send_long(vk_user_id, text)
+
+
+async def handle_vk_admin_callback(vk_user_id: int, payload: dict):
+    """Обработка кнопок админ-меню VK."""
+    cmd = payload.get("cmd")
+
+    if cmd == "vadm_stats":
+        if not await vk_is_moderator(vk_user_id):
+            return
+        await _vk_show_stats(vk_user_id)
+        return
+
+    if cmd == "vadm_broadcast":
+        if not vk_is_root(vk_user_id):
+            send_message(vk_user_id, "Только root-админ может рассылать.")
+            return
+        await handle_rassylka_start(vk_user_id)
+        return
+
+    if cmd == "vadm_assign":
+        role = payload.get("role")
+        if role == "admin" and not vk_is_root(vk_user_id):
+            send_message(vk_user_id, "Только root может назначать админов.")
+            return
+        if role == "moderator" and not await vk_is_admin(vk_user_id):
+            send_message(vk_user_id,
+                         "Только root или админ могут назначать модераторов.")
+            return
+        set_state(vk_user_id, "assign_role_target", assign_role=role)
+        role_label = "админа" if role == "admin" else "модератора"
+        send_message(
+            vk_user_id,
+            f"👑 Назначить {role_label}\n\n"
+            f"Пришли одно из:\n"
+            f"• Число (положительное — TG, отрицательное — VK)\n"
+            f"• vk.com/idXXXX — ссылка VK\n"
+            f"• @username или t.me/username — TG\n\n"
+            f"Юзер должен быть уже зарегистрирован в боте.\n\n"
+            f"Отмена: «отмена»",
+            keyboard=empty_keyboard(),
+        )
+        return
+
+    if cmd == "vadm_list":
+        role = payload.get("role")
+        if role == "admin" and not vk_is_root(vk_user_id):
+            send_message(vk_user_id, "Только root видит список админов.")
+            return
+        if role == "moderator" and not await vk_is_admin(vk_user_id):
+            send_message(vk_user_id, "Нет прав.")
+            return
+        items = await db.list_admins_by_role(role)
+        role_label = "Администраторы" if role == "admin" else "Модераторы"
+        if not items:
+            send_message(vk_user_id, f"📋 {role_label}: список пуст.")
+            return
+        lines = [f"📋 {role_label} ({len(items)}):", ""]
+        # Клавиатура с кнопками разжалования (по одной на юзера)
+        kb = VkKeyboard(inline=True)
+        can_demote = vk_is_root(vk_user_id) or (
+            role == "moderator" and await vk_is_admin(vk_user_id)
+        )
+        for it in items:
+            name = it.get("name") or "(без имени)"
+            uid = it["user_id"]
+            platform = "🌐 VK" if db.is_vk_user(uid) else "📱 TG"
+            lines.append(f"• {platform} {name} — {uid}")
+        send_message(vk_user_id, "\n".join(lines))
+        # Отдельно — кнопки разжалования (если можно)
+        if can_demote:
+            for it in items:
+                name = it.get("name") or f"id {it['user_id']}"
+                short_name = name[:20]
+                kb_demote = VkKeyboard(inline=True)
+                kb_demote.add_callback_button(
+                    f"❌ Разжаловать {short_name}",
+                    color=VkKeyboardColor.NEGATIVE,
+                    payload={"cmd": "vadm_demote", "target": it["user_id"]},
+                )
+                send_message(vk_user_id,
+                             f"Действия для «{name}»:",
+                             keyboard=kb_demote)
+        return
+
+    if cmd == "vadm_demote":
+        target_id = payload.get("target")
+        if target_id is None:
+            return
+        target_role = await db.get_role(target_id)
+        if target_role is None:
+            send_message(vk_user_id, "Уже разжалован.")
+            return
+        # Проверка прав
+        if vk_is_root(vk_user_id):
+            pass
+        elif await vk_is_admin(vk_user_id) and target_role == "moderator":
+            pass
+        else:
+            send_message(vk_user_id, "Нет прав.")
+            return
+        await db.remove_role(target_id)
+        target_user = await db.get_user(target_id)
+        target_name = target_user.get("name") if target_user else f"id {target_id}"
+        role_label = "админа" if target_role == "admin" else "модератора"
+        send_message(vk_user_id,
+                     f"❌ Разжаловал(а) {target_name} — больше не {role_label}.")
+        # Уведомление разжалованному
+        notify_text = f"ℹ️ Тебя разжаловали из {role_label} бота «Ковчег»."
+        if db.is_tg_user(target_id):
+            await db.queue_system_message(target_id, notify_text)
+        else:
+            try:
+                send_message(db.db_id_to_vk_id(target_id), notify_text)
+            except Exception:
+                pass
+        return
+
+
+async def handle_vk_assign_target(vk_user_id: int, text: str):
+    """Обработка ввода целевого юзера при назначении роли."""
+    text_lower = text.strip().lower()
+    if text_lower in ("отмена", "cancel", "/cancel"):
+        set_state(vk_user_id, None)
+        send_message(vk_user_id, "❌ Назначение отменено.",
+                     keyboard=await menu_for_vk(vk_user_id))
+        return
+
+    data = get_data(vk_user_id)
+    role = data.get("assign_role")
+    target_id = await _vk_parse_target_id(text.strip())
+    if target_id is None:
+        send_message(vk_user_id, "Не распознал ID. Попробуй ещё раз, "
+                                  "или напиши «отмена».")
+        return
+
+    target_user = await db.get_user(target_id)
+    if not target_user:
+        send_message(vk_user_id,
+                     "❌ Этот пользователь не найден в боте. "
+                     "Он должен сначала зарегистрироваться. "
+                     "Попробуй ещё раз или «отмена».")
+        return
+
+    # root в БД не хранится
+    if db.is_tg_user(target_id) and target_id in [_i for _i in [] if _i]:
+        pass  # TODO проверка root
+
+    # Назначаем
+    db_id_assignor = db.vk_id_to_db_id(vk_user_id)
+    await db.set_role(target_id, role, db_id_assignor)
+    set_state(vk_user_id, None)
+
+    target_name = target_user.get("name") or f"id {target_id}"
+    role_label = "админом" if role == "admin" else "модератором"
+    send_message(
+        vk_user_id,
+        f"✅ {target_name} (id {target_id}) назначен(а) {role_label}.",
+        keyboard=await menu_for_vk(vk_user_id),
+    )
+
+    # Уведомление новому
+    notify_text = (
+        f"🎉 Тебя назначили {role_label} бота «Ковчег»!\n\n"
+        f"Доступные команды:\n"
+        f"• /stats — статистика\n"
+        f"• /reports — жалобы\n"
+        f"• /baninfo ID — анкета\n"
+        f"• /userinfo ID — подробно\n"
+        f"• /ban ID причина — забанить\n"
+        f"• /unban ID — разбанить\n"
+        f"• /banlist — баны\n"
+        f"• Кнопка «👑 Админ» — меню"
+    )
+    if db.is_tg_user(target_id):
+        # TG-юзеру шлём через очередь
+        await db.queue_system_message(target_id, notify_text)
+    else:
+        # VK — прямо
+        try:
+            send_message(db.db_id_to_vk_id(target_id), notify_text)
+        except Exception:
+            pass
+
+
+# Простой парсер целевого ID (аналог TG-версии, только вынесен в VK-бот)
+import re as _re_vk_id
+_VK_ID_RE_VK = _re_vk_id.compile(r"vk\.com/(?:id)?(\d+)")
+_TG_USERNAME_RE_VK = _re_vk_id.compile(r"(?:t\.me/|@)([A-Za-z][\w]{3,31})")
+
+
+async def _vk_parse_target_id(arg: str) -> int | None:
+    """То же что parse_target_id в TG, но здесь для VK-бота."""
+    if not arg:
+        return None
+    arg = arg.strip()
+    try:
+        return int(arg)
+    except ValueError:
+        pass
+    m = _VK_ID_RE_VK.search(arg)
+    if m:
+        return -int(m.group(1))
+    m = _TG_USERNAME_RE_VK.search(arg)
+    if m:
+        user = await db.get_user_by_username(m.group(1))
+        if user:
+            return user["user_id"]
+    return None
 
 
 async def deliver_pending_notifications_vk():

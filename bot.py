@@ -52,8 +52,33 @@ else:
                     "Добавь ADMIN_IDS=твой_telegram_id в .env")
 
 
-def is_admin(user_id: int) -> bool:
+def is_root(user_id: int) -> bool:
+    """Root — админ из .env, разжаловать нельзя, макс. права."""
     return user_id in ADMIN_IDS
+
+
+async def is_admin(user_id: int) -> bool:
+    """Admin — root + любой admin в БД. Модер — НЕ включается сюда."""
+    if user_id in ADMIN_IDS:
+        return True
+    role = await db.get_role(user_id)
+    return role == "admin"
+
+
+async def is_moderator(user_id: int) -> bool:
+    """Modrator+ — root, admin или moderator. Т.е. любой уровень админства."""
+    if user_id in ADMIN_IDS:
+        return True
+    role = await db.get_role(user_id)
+    return role in ("admin", "moderator")
+
+
+async def get_admin_level(user_id: int) -> str | None:
+    """Возвращает уровень: 'root' | 'admin' | 'moderator' | None."""
+    if user_id in ADMIN_IDS:
+        return "root"
+    role = await db.get_role(user_id)
+    return role  # 'admin' / 'moderator' / None
 
 
 # ----------- Парсер target_id для админ-команд -----------
@@ -216,8 +241,8 @@ async def get_unsubscribed_channels(user_id: int) -> list[dict]:
     Если список пустой — пользователь подписан на все нужные каналы."""
     if not REQUIRED_CHANNELS:
         return []
-    if is_admin(user_id):
-        return []  # админам не мешаем
+    if is_root(user_id):
+        return []  # root-админам не мешаем
 
     missing = []
     for ch in REQUIRED_CHANNELS:
@@ -297,7 +322,7 @@ class BanMiddleware(BaseMiddleware):
     ) -> Any:
         # достаём id пользователя из события
         user = data.get("event_from_user")
-        if user and not is_admin(user.id):
+        if user and not is_root(user.id):
             ban = await db.get_ban(user.id)
             if ban:
                 # Тихо отвечаем — без диалога с забаненным
@@ -369,6 +394,11 @@ class BroadcastForm(StatesGroup):
     confirm = State()
 
 
+class AssignRoleForm(StatesGroup):
+    """FSM назначения новой роли — админ вводит ID/username/ссылку."""
+    waiting_target = State()
+
+
 # ----------- Список конфессий -----------
 DENOMINATIONS = [
     "Баптисты", "Пятидесятники", "АСД",
@@ -380,12 +410,41 @@ DENOMINATIONS = [
 
 # ----------- Клавиатуры -----------
 def main_menu_kb() -> ReplyKeyboardMarkup:
+    """Обычное меню для всех юзеров."""
     return ReplyKeyboardMarkup(
         keyboard=[
             [KeyboardButton(text="🔍 Смотреть анкеты")],
             [KeyboardButton(text="👤 Моя анкета"), KeyboardButton(text="💌 Мои матчи")],
-            [KeyboardButton(text="✏️ Заполнить заново")],
+            [KeyboardButton(text="✏️ Заполнить заново"), KeyboardButton(text="⚙️ Настройки")],
         ],
+        resize_keyboard=True,
+    )
+
+
+def main_menu_admin_kb() -> ReplyKeyboardMarkup:
+    """Меню для тех, у кого есть админская роль — как обычное + «👑 Админ»."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🔍 Смотреть анкеты")],
+            [KeyboardButton(text="👤 Моя анкета"), KeyboardButton(text="💌 Мои матчи")],
+            [KeyboardButton(text="✏️ Заполнить заново"), KeyboardButton(text="⚙️ Настройки")],
+            [KeyboardButton(text="👑 Админ")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def menu_for(user_id: int) -> ReplyKeyboardMarkup:
+    """Возвращает подходящее меню — админское или обычное."""
+    if await is_moderator(user_id):
+        return main_menu_admin_kb()
+    return main_menu_kb()
+
+
+def hidden_menu_kb() -> ReplyKeyboardMarkup:
+    """Меню для скрытых юзеров — только одна кнопка «Вернуть анкету»."""
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="🙋 Вернуть анкету")]],
         resize_keyboard=True,
     )
 
@@ -476,7 +535,7 @@ async def cmd_start(message: Message, state: FSMContext):
     if user:
         await message.answer(
             f"С возвращением, {user['name']}! Что будем делать?",
-            reply_markup=main_menu_kb(),
+            reply_markup=await menu_for(message.from_user.id),
         )
     else:
         await message.answer(
@@ -507,7 +566,7 @@ async def on_consent_accept(call: CallbackQuery, state: FSMContext):
         await bot.send_message(
             call.from_user.id,
             f"С возвращением, {user['name']}! Что будем делать?",
-            reply_markup=main_menu_kb(),
+            reply_markup=await menu_for(call.from_user.id),
         )
     else:
         await bot.send_message(
@@ -585,7 +644,7 @@ async def on_check_sub(call: CallbackQuery, state: FSMContext):
             await bot.send_message(
                 call.from_user.id,
                 f"С возвращением, {user['name']}! Что будем делать?",
-                reply_markup=main_menu_kb(),
+                reply_markup=await menu_for(call.from_user.id),
             )
         else:
             await bot.send_message(
@@ -604,6 +663,187 @@ async def on_check_sub(call: CallbackQuery, state: FSMContext):
 
 
 # ----------- Заполнение анкеты -----------
+# ============= НАСТРОЙКИ И «СКРЫТЬ АНКЕТУ» =============
+
+def _settings_kb() -> InlineKeyboardMarkup:
+    """Меню настроек: скрыть анкету + возможно другие в будущем."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👁 Скрыть мою анкету",
+                              callback_data="settings:hide")],
+        [InlineKeyboardButton(text="◀ Назад", callback_data="settings:back")],
+    ])
+
+
+def _hide_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, скрыть",
+                              callback_data="settings:hide_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="settings:back")],
+    ])
+
+
+def _return_prompt_kb() -> InlineKeyboardMarkup:
+    """Клавиатура для сообщения через 30 дней: вернуть/продлить/удалить."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🙋 Да, вернуть", callback_data="return:yes")],
+        [InlineKeyboardButton(text="🕊 Оставить скрытой ещё на 30 дней",
+                              callback_data="return:extend")],
+        [InlineKeyboardButton(text="🗑 Удалить анкету навсегда",
+                              callback_data="return:delete")],
+    ])
+
+
+@router.message(F.text == "⚙️ Настройки")
+async def settings_menu(message: Message):
+    u = await db.get_user(message.from_user.id)
+    if not u:
+        await message.answer("Сначала заполни анкету: /start")
+        return
+    # Проверка что не скрыт
+    if u.get("is_hidden"):
+        await message.answer(
+            "Твоя анкета скрыта. Нажми «🙋 Вернуть анкету», чтобы снова "
+            "листать ленту.",
+            reply_markup=hidden_menu_kb(),
+        )
+        return
+    await message.answer(
+        "⚙️ <b>Настройки</b>\n\n"
+        "Здесь можно временно скрыть свою анкету — она перестанет "
+        "показываться другим, но все свайпы, лайки и матчи сохранятся.",
+        reply_markup=_settings_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("settings:"))
+async def settings_callback(call: CallbackQuery):
+    action = call.data.split(":", 1)[1]
+    user_id = call.from_user.id
+
+    if action == "back":
+        await call.answer()
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        return
+
+    if action == "hide":
+        await call.answer()
+        await call.message.edit_text(
+            "👁 <b>Скрыть анкету?</b>\n\n"
+            "• Твою анкету перестанут показывать другим\n"
+            "• Ты не сможешь листать анкеты, пока не вернёшь свою\n"
+            "• Все свайпы, лайки и матчи сохранятся\n"
+            "• Через 30 дней бот сам напомнит: вернуть или удалить\n"
+            "• Ты можешь вернуть анкету в любой момент кнопкой в меню",
+            reply_markup=_hide_confirm_kb(),
+        )
+        return
+
+    if action == "hide_confirm":
+        await call.answer("Анкета скрыта")
+        await db.hide_user(user_id)
+        try:
+            await call.message.delete()
+        except Exception:
+            pass
+        await bot.send_message(
+            user_id,
+            "✅ Твоя анкета скрыта. Через 30 дней я напомню — "
+            "вернуть или окончательно удалить.\n\n"
+            "Если передумаешь раньше — жми «🙋 Вернуть анкету».",
+            reply_markup=hidden_menu_kb(),
+        )
+        return
+
+
+@router.message(F.text == "🙋 Вернуть анкету")
+async def return_from_hidden(message: Message):
+    u = await db.get_user(message.from_user.id)
+    if not u or not u.get("is_hidden"):
+        await message.answer("Твоя анкета уже активна.",
+                             reply_markup=main_menu_kb())
+        return
+    await db.unhide_user(message.from_user.id)
+    await message.answer(
+        "🙋 Анкета снова активна! Люди видят её, ты можешь листать ленту.",
+        reply_markup=main_menu_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("return:"))
+async def return_prompt_callback(call: CallbackQuery):
+    """Обработка выбора в напоминании через 30 дней."""
+    action = call.data.split(":", 1)[1]
+    user_id = call.from_user.id
+
+    if action == "yes":
+        await call.answer("Анкета возвращена")
+        await db.unhide_user(user_id)
+        try:
+            await call.message.edit_text(
+                "🙋 Отлично! Твоя анкета снова в ленте."
+            )
+        except Exception:
+            pass
+        await bot.send_message(user_id, "С возвращением!",
+                                reply_markup=main_menu_kb())
+        return
+
+    if action == "extend":
+        await call.answer("Продлил ещё на 30 дней")
+        await db.extend_hide(user_id)
+        try:
+            await call.message.edit_text(
+                "🕊 Хорошо, продлил скрытие ещё на 30 дней. "
+                "Через месяц снова напомню."
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "delete":
+        await call.answer()
+        # Подтверждение
+        confirm_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить навсегда",
+                                  callback_data="return:delete_confirm")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="return:cancel_delete")],
+        ])
+        try:
+            await call.message.edit_text(
+                "🗑 <b>Удалить анкету навсегда?</b>\n\n"
+                "Будут удалены: анкета, все фото, свайпы, лайки, матчи. "
+                "Это действие необратимо.",
+                reply_markup=confirm_kb,
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "delete_confirm":
+        await call.answer("Удаляю…")
+        await db.delete_user_completely(user_id)
+        try:
+            await call.message.edit_text(
+                "🗑 Анкета удалена. Если захочешь вернуться — /start."
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "cancel_delete":
+        await call.answer("Отменено")
+        try:
+            await call.message.edit_text(
+                "Отмена. Анкета осталась скрытой. Через 30 дней снова напомню."
+            )
+        except Exception:
+            pass
+        return
+
+
 @router.message(F.text == "✏️ Заполнить заново")
 async def restart_form(message: Message, state: FSMContext):
     await state.clear()
@@ -973,7 +1213,7 @@ async def form_photo_done(call: CallbackQuery, state: FSMContext):
         f"✅ Анкета сохранена! Загружено фото: {len(photos)}." + extra_text + "\n\n"
         "Жми «🔍 Смотреть анкеты», чтобы начать знакомиться. "
         "Если кто-то ответит взаимностью — я пришлю тебе его контакт.",
-        reply_markup=main_menu_kb(),
+        reply_markup=await menu_for(call.from_user.id),
     )
 
 
@@ -1256,6 +1496,12 @@ async def browse_profiles(message: Message, state: FSMContext):
     if not user:
         await message.answer("Сначала заполни анкету: /start")
         return
+    if user.get("is_hidden"):
+        await message.answer(
+            "Твоя анкета скрыта — сначала верни её, чтобы листать других.",
+            reply_markup=hidden_menu_kb(),
+        )
+        return
     if not await require_fillin(message, state):
         return
     await show_next_profile(message.from_user.id, message.chat.id)
@@ -1440,10 +1686,16 @@ async def my_profile(message: Message, state: FSMContext):
         partner = "девушки" if u["gender"] == "M" else "молодого человека"
         caption += f"\n\n🔎 <b>Ищу возраст {partner}:</b> {age_min}–{age_max} лет"
 
+    # Если анкета скрыта — показываем предупреждение и особую клавиатуру
+    if u.get("is_hidden"):
+        caption += "\n\n👁 <b>Анкета скрыта</b> — сейчас её никто не видит."
+        kb = hidden_menu_kb()
+    else:
+        kb = main_menu_kb()
+
     if len(photos) == 1:
         src = photo_source_from_dict(photos[0])
-        await message.answer_photo(src, caption=caption,
-                                   reply_markup=main_menu_kb())
+        await message.answer_photo(src, caption=caption, reply_markup=kb)
     else:
         # Медиа-группа: подпись на первом фото
         media = [InputMediaPhoto(media=photo_source_from_dict(photos[0]),
@@ -1452,7 +1704,7 @@ async def my_profile(message: Message, state: FSMContext):
             media.append(InputMediaPhoto(media=photo_source_from_dict(p)))
         await message.answer_media_group(media)
         await message.answer(f"Загружено фото: {len(photos)}.",
-                             reply_markup=main_menu_kb())
+                             reply_markup=kb)
 
 
 # ----------- Список матчей -----------
@@ -1465,16 +1717,37 @@ async def my_matches(message: Message, state: FSMContext):
     if not await require_fillin(message, state):
         return
     matches = await db.get_matches(message.from_user.id)
+    my_kb = await menu_for(message.from_user.id)
     if not matches:
         await message.answer("Пока ни одного матча. Лайкай анкеты — найдёшь!",
-                             reply_markup=main_menu_kb())
+                             reply_markup=my_kb)
         return
-    lines = ["<b>Твои матчи:</b>\n"]
+    lines = ["<b>💌 Твои матчи:</b>\n"]
     for m in matches:
-        contact = (f'@{m["username"]}' if m["username"]
-                   else f'(без username, id {m["user_id"]})')
-        lines.append(f"• {m['name']}, {m['age']} — {contact}")
-    await message.answer("\n".join(lines), reply_markup=main_menu_kb())
+        # Иконка платформы: 🌐 для VK, 📱 для TG
+        is_vk = db.is_vk_user(m["user_id"])
+        icon = "🌐" if is_vk else "📱"
+        # Ссылка на профиль
+        if is_vk:
+            # VK — screen_name или id
+            username = m.get("username") or f"id{db.db_id_to_vk_id(m['user_id'])}"
+            link = f"https://vk.com/{username}"
+        else:
+            # TG — по username
+            if m.get("username"):
+                link = f"https://t.me/{m['username']}"
+            else:
+                link = None
+        # Имя-fallback: если пусто, показываем «Без имени»
+        name = m.get("name") or "Без имени"
+        display = f"{name}, {m['age']}"
+        if link:
+            lines.append(f'{icon} <a href="{link}">{display}</a>')
+        else:
+            # У TG-юзеров без username ссылки нет — показываем просто текст
+            lines.append(f"{icon} <b>{display}</b> (без username, id {m['user_id']})")
+    await message.answer("\n".join(lines), reply_markup=my_kb,
+                         disable_web_page_preview=True)
 
 
 # ----------- Уведомление админов о жалобах -----------
@@ -1565,7 +1838,7 @@ async def on_forget_confirm(call: CallbackQuery):
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
     """Справка по командам админа."""
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     await message.answer(
         "<b>Админ-команды:</b>\n\n"
@@ -1584,7 +1857,7 @@ async def cmd_admin(message: Message):
 # ----------- /stats -----------
 @router.message(Command("stats"))
 async def cmd_stats(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     s = await db.get_stats()
 
@@ -1636,7 +1909,7 @@ async def cmd_stats(message: Message):
 
 @router.message(Command("ban"))
 async def cmd_ban(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 2:
@@ -1648,8 +1921,8 @@ async def cmd_ban(message: Message):
         return
     reason = parts[2] if len(parts) > 2 else "не указана"
 
-    if is_admin(target_id):
-        await message.answer("⚠️ Нельзя забанить админа.")
+    if await is_moderator(target_id):
+        await message.answer("⚠️ Нельзя забанить админа или модератора.")
         return
 
     target = await db.get_user(target_id)
@@ -1680,7 +1953,7 @@ async def cmd_ban(message: Message):
 
 @router.message(Command("unban"))
 async def cmd_unban(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     parts = (message.text or "").split()
     if len(parts) < 2:
@@ -1707,7 +1980,7 @@ async def cmd_unban(message: Message):
 
 @router.message(Command("banlist"))
 async def cmd_banlist(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     bans = await db.get_all_bans()
     if not bans:
@@ -1726,7 +1999,7 @@ async def cmd_banlist(message: Message):
 
 @router.message(Command("baninfo"))
 async def cmd_baninfo(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     parts = (message.text or "").split()
     if len(parts) < 2:
@@ -1794,7 +2067,7 @@ async def cmd_baninfo(message: Message):
 # ----------- /userinfo — полное досье на пользователя -----------
 @router.message(Command("userinfo"))
 async def cmd_userinfo(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     parts = (message.text or "").split()
     if len(parts) < 2:
@@ -1920,7 +2193,7 @@ async def cmd_userinfo(message: Message):
 
 @router.message(Command("reports"))
 async def cmd_reports(message: Message):
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
     reports = await db.get_recent_reports(limit=20)
     if not reports:
@@ -1952,7 +2225,7 @@ async def cmd_migrate_photos(message: Message):
     """Скачивает все TG-фото с серверов Telegram на наш VPS.
     Выполняется один раз при переходе на локальное хранилище.
     Идемпотентна: повторный запуск пропускает уже скачанные файлы."""
-    if not is_admin(message.from_user.id):
+    if not await is_moderator(message.from_user.id):
         return
 
     import photo_utils
@@ -2116,8 +2389,8 @@ def _broadcast_confirm_kb() -> InlineKeyboardMarkup:
 
 @router.message(Command("rassylka"))
 async def cmd_rassylka(message: Message, state: FSMContext):
-    """Запуск рассылки. Доступно только админам."""
-    if not is_admin(message.from_user.id):
+    """Запуск рассылки. Доступно ТОЛЬКО root-админам (из .env)."""
+    if not is_root(message.from_user.id):
         return
     await state.clear()
     await state.set_state(BroadcastForm.text)
@@ -2213,7 +2486,7 @@ async def _show_preview(call: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("bc:"))
 async def broadcast_callback(call: CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
+    if not is_root(call.from_user.id):
         await call.answer()
         return
     cur_state = await state.get_state()
@@ -2492,6 +2765,486 @@ async def _run_broadcast(call: CallbackQuery, state: FSMContext):
     )
 
 
+# ============= ПЛАНИРОВЩИК УВЕДОМЛЕНИЙ =============
+# Раз в час бот смотрит на текущее время и, если пора — рассылает уведомления.
+# TG-получателям шлём напрямую, VK — через очередь (VK-бот сам разошлёт).
+
+from datetime import datetime, timezone, timedelta
+
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+
+async def _dispatch_notif(user_id: int, text: str, kind: str = "system_message"):
+    """Универсальный отправитель уведомления: TG напрямую, VK через очередь."""
+    if db.is_tg_user(user_id):
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            logging.warning(f"notif TG to {user_id} failed: {e}")
+    else:
+        # В очередь как system_message — VK-бот разошлёт
+        await db.queue_system_message(user_id, text)
+
+
+async def send_weekly_new_profiles_notif():
+    """Суббота 21:00 МСК: «X новых анкет за неделю в твоём возрасте»."""
+    recipients = await db.get_weekly_notif_recipients()
+    if not recipients:
+        logging.info("Weekly notif: получателей 0")
+        return
+    logging.info(f"Weekly notif: получателей {len(recipients)}")
+    notified_ids = []
+    for r in recipients:
+        n = r["new_count"]
+        # Правильное склонение слова
+        if n == 1:
+            word = "новая анкета"
+        elif 2 <= n <= 4:
+            word = "новые анкеты"
+        else:
+            word = "новых анкет"
+        text = (
+            f"✨ За эту неделю у нас {n} {word} "
+            f"(возраст {r['a_min']}–{r['a_max']}).\n\n"
+            f"Загляни в ленту — может кого-то встретишь! 🕊"
+        )
+        await _dispatch_notif(r["user_id"], text)
+        notified_ids.append(r["user_id"])
+        await asyncio.sleep(0.05)  # rate limit
+    await db.mark_weekly_notified(notified_ids)
+    logging.info(f"Weekly notif: отправлено {len(notified_ids)}")
+
+
+async def send_daily_likes_notif():
+    """Ежедневно 21:00 МСК: «Сегодня тебя лайкнули X человек»."""
+    recipients = await db.get_daily_likes_recipients()
+    if not recipients:
+        logging.info("Daily likes notif: получателей 0")
+        return
+    logging.info(f"Daily likes notif: получателей {len(recipients)}")
+    notified_ids = []
+    for r in recipients:
+        n = r["likes_count"]
+        # Склонение
+        if n == 1:
+            word = "человек лайкнул"
+        elif 2 <= n <= 4:
+            word = "человека лайкнули"
+        else:
+            word = "человек лайкнули"
+        text = (
+            f"❤️ Сегодня твою анкету {word} — <b>{n}</b>.\n\n"
+            f"Загляни в «💌 Мои матчи» — возможно, кто-то уже мэтч!"
+        )
+        await _dispatch_notif(r["user_id"], text)
+        notified_ids.append(r["user_id"])
+        await asyncio.sleep(0.05)
+    await db.mark_daily_likes_notified(notified_ids)
+    logging.info(f"Daily likes notif: отправлено {len(notified_ids)}")
+
+
+async def send_hidden_30days_prompt():
+    """Ежедневно проверяем: у кого скрытие ≥30 дней — предложить вернуться."""
+    users = await db.get_users_hidden_30_days()
+    if not users:
+        return
+    logging.info(f"Hidden 30d prompt: {len(users)} юзеров")
+    for u in users:
+        uid = u["user_id"]
+        text = (
+            "👋 Прошёл месяц с тех пор как ты скрыл(а) анкету.\n\n"
+            "Что хочешь сделать?"
+        )
+        if db.is_tg_user(uid):
+            try:
+                await bot.send_message(uid, text,
+                                       reply_markup=_return_prompt_kb())
+            except Exception as e:
+                logging.warning(f"hidden prompt TG to {uid} failed: {e}")
+        else:
+            # VK-юзеру шлём просто текст-напоминание, а разберётся через
+            # своё меню (в VK инлайн-кнопки для команд типа «return» сложнее
+            # синхронизировать — юзер просто пишет «вернуть анкету»)
+            await db.queue_system_message(
+                uid,
+                "👋 Прошёл месяц с тех пор как ты скрыл(а) анкету.\n"
+                "Напиши «вернуть» чтобы вернуть анкету, «удалить» чтобы "
+                "удалить навсегда, или ничего — тогда останется скрытой.",
+            )
+        # Продлеваем скрытие на 30 дней, чтобы завтра снова не спросить
+        # (если пользователь ответит — extend/return сработают заново)
+        await db.extend_hide(uid)
+        await asyncio.sleep(0.05)
+
+
+# Флаги, чтобы не запускать одну и ту же задачу дважды за одну итерацию
+_last_weekly_run: str = ""
+_last_daily_likes_run: str = ""
+_last_hidden_prompt_run: str = ""
+
+
+# ============= АДМИН-МЕНЮ («👑 Админ») =============
+# Кнопка «👑 Админ» открывает подменю с inline-кнопками.
+# Наполнение зависит от роли:
+#   root      : Статистика, Рассылка, Назначить админа, Назначить модератора,
+#               Список админов, Список модераторов
+#   admin     : Статистика, Назначить модератора, Список модераторов
+#   moderator : Статистика
+
+async def _admin_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура админ-меню для конкретного юзера — по его роли."""
+    level = await get_admin_level(user_id)
+    rows = [[InlineKeyboardButton(text="📊 Статистика",
+                                   callback_data="adm:stats")]]
+
+    if level == "root":
+        rows.append([InlineKeyboardButton(text="📢 Рассылка",
+                                          callback_data="adm:broadcast")])
+        rows.append([
+            InlineKeyboardButton(text="👑 Назначить админа",
+                                 callback_data="adm:assign:admin"),
+            InlineKeyboardButton(text="🛡 Назначить модератора",
+                                 callback_data="adm:assign:moderator"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="📋 Админы",
+                                 callback_data="adm:list:admin"),
+            InlineKeyboardButton(text="📋 Модераторы",
+                                 callback_data="adm:list:moderator"),
+        ])
+    elif level == "admin":
+        rows.append([InlineKeyboardButton(text="🛡 Назначить модератора",
+                                          callback_data="adm:assign:moderator")])
+        rows.append([InlineKeyboardButton(text="📋 Модераторы",
+                                          callback_data="adm:list:moderator")])
+
+    # Модератору доступна только статистика — доп. кнопок нет.
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(F.text == "👑 Админ")
+async def admin_menu_button(message: Message, state: FSMContext):
+    """Обработчик кнопки главного меню."""
+    if not await is_moderator(message.from_user.id):
+        # Тихо игнорируем — у обычного юзера этой кнопки и не должно быть,
+        # но на всякий случай (мог руками написать)
+        return
+    await state.clear()
+    level = await get_admin_level(message.from_user.id)
+    level_label = {"root": "🔴 Root", "admin": "🟠 Админ",
+                    "moderator": "🟡 Модератор"}[level]
+    await message.answer(
+        f"👑 <b>Админ-меню</b>\nТвоя роль: {level_label}\n\n"
+        "Выбери действие:",
+        reply_markup=await _admin_menu_kb(message.from_user.id),
+    )
+
+
+@router.message(Command("admin"))
+async def cmd_admin_menu(message: Message, state: FSMContext):
+    """Аналог кнопки «👑 Админ» — команда."""
+    await admin_menu_button(message, state)
+
+
+@router.callback_query(F.data == "adm:stats")
+async def admin_menu_stats(call: CallbackQuery):
+    if not await is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await call.answer("Загружаю…")
+    # Вызываем существующую /stats — она отправит статистику новым сообщением
+    fake_msg = call.message.model_copy(update={"from_user": call.from_user})
+    await cmd_stats(fake_msg)
+
+
+@router.callback_query(F.data == "adm:broadcast")
+async def admin_menu_broadcast(call: CallbackQuery, state: FSMContext):
+    """Открывает рассылку — только root."""
+    if not is_root(call.from_user.id):
+        await call.answer("Только root-админ может рассылать.", show_alert=True)
+        return
+    await call.answer()
+    # Запускаем FSM рассылки как /rassylka
+    await state.clear()
+    await state.set_state(BroadcastForm.text)
+    await bot.send_message(
+        call.from_user.id,
+        "📝 <b>Рассылка</b>\n\n"
+        "Напиши текст (5–4000 символов).\n"
+        "Можно HTML: <code>&lt;b&gt;</code>, <code>&lt;i&gt;</code>, "
+        "<code>&lt;a href='URL'&gt;</code>. В VK теги убираются.\n\n"
+        "Отмена: /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+# ---- Назначение роли ----
+
+@router.callback_query(F.data.startswith("adm:assign:"))
+async def admin_menu_assign(call: CallbackQuery, state: FSMContext):
+    """Кнопка «Назначить админа/модератора» — вход в FSM."""
+    role = call.data.split(":")[2]  # 'admin' | 'moderator'
+
+    # Проверка прав
+    if role == "admin" and not is_root(call.from_user.id):
+        await call.answer("Только root может назначать админов.", show_alert=True)
+        return
+    if role == "moderator" and not await is_admin(call.from_user.id):
+        # is_admin включает root + admin — оба могут назначать модератора
+        await call.answer("Только root или админ могут назначать модераторов.",
+                          show_alert=True)
+        return
+
+    await call.answer()
+    await state.set_state(AssignRoleForm.waiting_target)
+    await state.update_data(assign_role=role)
+    role_label = "админа" if role == "admin" else "модератора"
+    await bot.send_message(
+        call.from_user.id,
+        f"👑 <b>Назначить {role_label}</b>\n\n"
+        f"Пришли одно из:\n"
+        f"• <code>123456</code> — TG ID\n"
+        f"• <code>-123456</code> — VK ID (со знаком минус)\n"
+        f"• <code>vk.com/id123456</code> — ссылка VK\n"
+        f"• <code>@username</code> или <code>t.me/username</code> — TG\n\n"
+        f"Юзер должен быть зарегистрирован в боте.\n\n"
+        f"Отмена: /cancel",
+        reply_markup=ReplyKeyboardRemove(),
+    )
+
+
+@router.message(AssignRoleForm.waiting_target, Command("cancel"))
+async def assign_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("❌ Назначение отменено.",
+                         reply_markup=await menu_for(message.from_user.id))
+
+
+@router.message(AssignRoleForm.waiting_target, F.text)
+async def assign_target_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    role = data.get("assign_role")  # 'admin' | 'moderator'
+    target_id = await parse_target_id((message.text or "").strip())
+    if target_id is None:
+        await message.answer(
+            "Не распознал ID. Пришли ещё раз в правильном формате, "
+            "или /cancel."
+        )
+        return
+
+    # Проверка что юзер существует в БД
+    target_user = await db.get_user(target_id)
+    if not target_user:
+        await message.answer(
+            "❌ Этот пользователь не найден в боте.\n"
+            "Он должен сначала зарегистрироваться (напишет /start в боте).\n\n"
+            "Попробуй ещё раз или /cancel."
+        )
+        return
+
+    # Проверка на root — root в БД не хранится, но лучше не путать
+    if is_root(target_id):
+        await message.answer("Это уже root-админ (из .env), назначать не нужно.")
+        await state.clear()
+        return
+
+    # Назначаем
+    await db.set_role(target_id, role, message.from_user.id)
+    await state.clear()
+
+    target_name = target_user.get("name") or f"id {target_id}"
+    role_label = "админом" if role == "admin" else "модератором"
+    await message.answer(
+        f"✅ <b>{target_name}</b> (id {target_id}) назначен(а) {role_label}.",
+        reply_markup=await menu_for(message.from_user.id),
+    )
+
+    # Уведомляем нового
+    notify_text = (
+        f"🎉 Тебя назначили <b>{role_label}</b> бота «Ковчег»!\n\n"
+        f"Доступные команды:\n"
+        f"• /stats — статистика\n"
+        f"• /reports — жалобы\n"
+        f"• /baninfo <ID> — анкета\n"
+        f"• /userinfo <ID> — подробно\n"
+        f"• /ban <ID> причина — забанить\n"
+        f"• /unban <ID> — разбанить\n"
+        f"• /banlist — список банов\n"
+        f"• /admin — открыть меню"
+    )
+    if db.is_tg_user(target_id):
+        try:
+            await bot.send_message(target_id, notify_text)
+        except Exception:
+            pass
+    else:
+        # VK — через очередь
+        # Упростим текст (VK не понимает HTML)
+        vk_text = notify_text.replace("<b>", "").replace("</b>", "")
+        await db.queue_system_message(target_id, vk_text)
+
+
+# ---- Список админов/модераторов + разжалование ----
+
+@router.callback_query(F.data.startswith("adm:list:"))
+async def admin_menu_list(call: CallbackQuery):
+    """Показать список админов/модераторов с кнопками разжалования."""
+    role = call.data.split(":")[2]  # 'admin' | 'moderator'
+
+    # Проверка прав на просмотр:
+    # - список админов — только root
+    # - список модераторов — root или admin
+    if role == "admin" and not is_root(call.from_user.id):
+        await call.answer("Только root видит список админов.", show_alert=True)
+        return
+    if role == "moderator" and not await is_admin(call.from_user.id):
+        await call.answer("Только root или админ.", show_alert=True)
+        return
+
+    await call.answer()
+    items = await db.list_admins_by_role(role)
+    role_label = "Администраторы" if role == "admin" else "Модераторы"
+
+    if not items:
+        try:
+            await call.message.edit_text(
+                f"📋 <b>{role_label}</b>\n\n"
+                "Список пуст.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="◀ Назад",
+                                          callback_data="adm:back"),
+                ]]),
+            )
+        except Exception:
+            pass
+        return
+
+    # Строим кнопки разжалования
+    rows = []
+    lines = [f"📋 <b>{role_label}</b> ({len(items)}):", ""]
+    for it in items:
+        name = it.get("name") or "(без имени)"
+        uid = it["user_id"]
+        platform = "🌐 VK" if db.is_vk_user(uid) else "📱 TG"
+        lines.append(f"• {platform} {name} — <code>{uid}</code>")
+        # Кнопка разжаловать — только root, или admin (если разжаловать модератора)
+        can_demote = is_root(call.from_user.id) or (
+            role == "moderator" and await is_admin(call.from_user.id)
+        )
+        if can_demote:
+            rows.append([InlineKeyboardButton(
+                text=f"❌ Разжаловать {name}",
+                callback_data=f"adm:demote:{uid}",
+            )])
+    rows.append([InlineKeyboardButton(text="◀ Назад", callback_data="adm:back")])
+
+    try:
+        await call.message.edit_text(
+            "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("adm:demote:"))
+async def admin_menu_demote(call: CallbackQuery):
+    target_id = int(call.data.split(":")[2])
+
+    # Проверка прав на разжалование:
+    #   root разжалует любого
+    #   admin разжалует только модератора
+    target_role = await db.get_role(target_id)
+    if target_role is None:
+        await call.answer("Уже разжалован.", show_alert=True)
+        return
+
+    if is_root(call.from_user.id):
+        pass  # root может всё
+    elif await is_admin(call.from_user.id) and target_role == "moderator":
+        pass  # admin разжалует модератора
+    else:
+        await call.answer("Нет прав.", show_alert=True)
+        return
+
+    await db.remove_role(target_id)
+    await call.answer("Разжалован")
+
+    target_user = await db.get_user(target_id)
+    target_name = target_user.get("name") if target_user else f"id {target_id}"
+    role_label = "админа" if target_role == "admin" else "модератора"
+    try:
+        await call.message.edit_text(
+            f"❌ Разжаловал(а) {target_name} — больше не {role_label}.",
+        )
+    except Exception:
+        pass
+
+    # Уведомляем разжалованного
+    notify_text = f"ℹ️ Тебя разжаловали из {role_label} бота «Ковчег»."
+    if db.is_tg_user(target_id):
+        try:
+            await bot.send_message(target_id, notify_text)
+        except Exception:
+            pass
+    else:
+        await db.queue_system_message(target_id, notify_text)
+
+
+@router.callback_query(F.data == "adm:back")
+async def admin_menu_back(call: CallbackQuery):
+    """Кнопка «Назад» — возврат в главное админ-меню."""
+    if not await is_moderator(call.from_user.id):
+        await call.answer()
+        return
+    await call.answer()
+    level = await get_admin_level(call.from_user.id)
+    level_label = {"root": "🔴 Root", "admin": "🟠 Админ",
+                    "moderator": "🟡 Модератор"}[level]
+    try:
+        await call.message.edit_text(
+            f"👑 <b>Админ-меню</b>\nТвоя роль: {level_label}\n\n"
+            "Выбери действие:",
+            reply_markup=await _admin_menu_kb(call.from_user.id),
+        )
+    except Exception:
+        pass
+
+
+async def scheduler_loop():
+    """Раз в минуту проверяем текущее московское время. Если пора — запускаем.
+    Флаги дней (например, 2026-07-19) предотвращают повтор в одном дне."""
+    global _last_weekly_run, _last_daily_likes_run, _last_hidden_prompt_run
+    logging.info("Планировщик уведомлений запущен.")
+    while True:
+        try:
+            now = datetime.now(MOSCOW_TZ)
+            today_str = now.strftime("%Y-%m-%d")
+
+            # Суббота = weekday() == 5 в питоне. 21:00 МСК.
+            if (now.weekday() == 5 and now.hour == 21
+                    and _last_weekly_run != today_str):
+                _last_weekly_run = today_str
+                logging.info("Планировщик: запуск weekly новых анкет")
+                asyncio.create_task(send_weekly_new_profiles_notif())
+
+            # Ежедневно 21:00 МСК — итог лайков
+            if now.hour == 21 and _last_daily_likes_run != today_str:
+                _last_daily_likes_run = today_str
+                logging.info("Планировщик: запуск daily лайков")
+                asyncio.create_task(send_daily_likes_notif())
+
+            # Ежедневно 12:00 МСК — напоминание тем кто скрыл ≥30 дней
+            if now.hour == 12 and _last_hidden_prompt_run != today_str:
+                _last_hidden_prompt_run = today_str
+                logging.info("Планировщик: запуск hidden 30d")
+                asyncio.create_task(send_hidden_30days_prompt())
+
+        except Exception as e:
+            logging.exception(f"scheduler_loop error: {e}")
+        await asyncio.sleep(60)
+
+
 # ----------- Фоновая задача: доставка кросс-платформенных уведомлений -----------
 async def deliver_pending_notifications():
     """Раз в 3 секунды смотрим в очередь pending_notifications.
@@ -2591,6 +3344,8 @@ async def main():
     await bot.delete_webhook(drop_pending_updates=True)
     # Фоновая задача доставки кросс-платформенных уведомлений
     asyncio.create_task(deliver_pending_notifications())
+    # Планировщик еженедельных / ежедневных уведомлений
+    asyncio.create_task(scheduler_loop())
     await dp.start_polling(bot)
 
 
