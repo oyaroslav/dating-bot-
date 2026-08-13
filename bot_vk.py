@@ -152,6 +152,14 @@ STATES = (
     "bc_text", "bc_age", "bc_city",
     # Назначение роли (админ вводит ID):
     "assign_role_target",
+    # Редактирование анкеты:
+    "vedit_name", "vedit_age",
+    "vedit_age_min", "vedit_age_max",
+    "vedit_city",
+    "vedit_denomination_other",
+    "vedit_church", "vedit_church_role", "vedit_job",
+    "vedit_hobbies",
+    "vedit_photos",
 )
 
 
@@ -899,6 +907,11 @@ async def handle_message(event):
         await handle_form_photo(vk_user_id, msg)
         return
 
+    # Загрузка фото при редактировании анкеты
+    if state == "vedit_photos" and msg.get("attachments"):
+        await handle_vedit_photo(vk_user_id, msg.get("attachments") or [])
+        return
+
     # Системные команды доступны всегда
     if lower in ("start", "/start", "начать", "старт"):
         await handle_start(vk_user_id)
@@ -1051,8 +1064,42 @@ async def handle_message(event):
                 f"\n🔎 Ищу возраст {partner}: "
                 f"{u['partner_age_min']}–{u['partner_age_max']} лет"
             )
-            send_message(vk_user_id, "\n".join(profile_lines),
-                         keyboard=main_menu_keyboard())
+            if u.get("is_hidden"):
+                profile_lines.append(
+                    "\n👁 Анкета скрыта — сейчас её никто не видит."
+                )
+
+            # Показываем фото (первое — с текстом, остальные без)
+            photos = await db.get_user_photos_with_paths(db_id)
+            valid_photos = []
+            for p in (photos or []):
+                fp = p.get("file_path")
+                if fp and os.path.exists(fp) and os.path.getsize(fp) > 0:
+                    valid_photos.append(p)
+
+            text_body = "\n".join(profile_lines)
+            if valid_photos:
+                # Первое фото — с текстом-подписью, остальные — только фото
+                first_attach = upload_photo_to_messages(
+                    valid_photos[0]["file_path"], vk_user_id,
+                )
+                send_message(vk_user_id, text_body, attachment=first_attach)
+                for p in valid_photos[1:]:
+                    attach = upload_photo_to_messages(p["file_path"], vk_user_id)
+                    if attach:
+                        send_message(vk_user_id, "", attachment=attach)
+            else:
+                send_message(vk_user_id, text_body)
+
+            # Кнопка «Редактировать»
+            kb = VkKeyboard(inline=True)
+            kb.add_callback_button("✏️ Редактировать анкету",
+                                    color=VkKeyboardColor.PRIMARY,
+                                    payload={"cmd": "vedit_open"})
+            send_message(vk_user_id, "Что дальше?", keyboard=kb)
+            # Основное меню — под низом чата (не inline)
+            send_message(vk_user_id, "Меню:",
+                         keyboard=await menu_for_vk(vk_user_id))
             return
         if text == "💌 Мои матчи":
             if not await require_consent(vk_user_id):
@@ -1117,6 +1164,30 @@ async def handle_message(event):
         await handle_rassylka_city(vk_user_id, text)
     elif state == "assign_role_target":
         await handle_vk_assign_target(vk_user_id, text)
+    elif state == "vedit_name":
+        await handle_vedit_name(vk_user_id, text)
+    elif state == "vedit_age":
+        await handle_vedit_age(vk_user_id, text)
+    elif state == "vedit_age_min":
+        await handle_vedit_age_min(vk_user_id, text)
+    elif state == "vedit_age_max":
+        await handle_vedit_age_max(vk_user_id, text)
+    elif state == "vedit_city":
+        await handle_vedit_city(vk_user_id, text)
+    elif state == "vedit_denomination_other":
+        await handle_vedit_denom_other(vk_user_id, text)
+    elif state == "vedit_church":
+        await handle_vedit_church(vk_user_id, text)
+    elif state == "vedit_church_role":
+        await handle_vedit_church_role(vk_user_id, text)
+    elif state == "vedit_job":
+        await handle_vedit_job(vk_user_id, text)
+    elif state == "vedit_hobbies":
+        await handle_vedit_hobbies(vk_user_id, text)
+    elif state == "vedit_photos":
+        # Юзер прислал текст вместо фото на этапе загрузки
+        send_message(vk_user_id, "Пришли фото (не текст).",
+                     keyboard=_vedit_cancel_kb())
     elif state == "photo":
         # Текст на этапе фото — подсказка
         send_message(
@@ -1218,6 +1289,10 @@ async def handle_callback(event):
     elif cmd and cmd.startswith("vadm_"):
         # Админ-меню VK
         await handle_vk_admin_callback(vk_user_id, payload)
+
+    elif cmd and cmd.startswith("vedit_"):
+        # Редактирование анкеты VK
+        await handle_vedit_callback(vk_user_id, payload)
 
     elif cmd == "settings_back":
         # Просто игнорируем — inline-кнопка "Назад"
@@ -2216,6 +2291,25 @@ async def _vk_show_stats(vk_user_id: int):
         return "\n".join(f"  {i+1}. {name} — {cnt}"
                          for i, (name, cnt) in enumerate(items))
 
+    def fmt_denoms(items: list) -> str:
+        if not items:
+            return "  (нет данных)"
+        lines = []
+        for i, (name, total, male, female) in enumerate(items, 1):
+            if total == 0:
+                lines.append(f"  {i}. {name} — 0")
+            else:
+                lines.append(
+                    f"  {i}. {name} — {total} (М: {male} / Ж: {female})"
+                )
+        return "\n".join(lines)
+
+    def fmt_other(items: list) -> str:
+        if not items:
+            return "  (нет)"
+        return "\n".join(f"  {i+1}. {name} — {cnt}"
+                          for i, (name, cnt) in enumerate(items))
+
     text = (
         "📊 Статистика бота\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -2238,7 +2332,11 @@ async def _vk_show_stats(vk_user_id: int):
         f"  За 24ч: +{s['matches_24h']}\n"
         f"  За 7 дней: +{s['matches_7d']}\n\n"
         f"🏙 Топ городов\n{fmt_top(s['top_cities'])}\n\n"
-        f"⛪ Топ церквей\n{fmt_top(s['top_churches'])}\n\n"
+        f"✝️ Конфессии\n{fmt_denoms(s['denominations'])}\n\n"
+        f"📝 Другое ({s['denom_other_total']}):\n{fmt_other(s['denom_other_top'])}\n"
+        + (f"\nНе указано: {s['denom_not_set']}\n"
+           if s['denom_not_set'] else "")
+        + "\n"
         "🛡 Модерация\n"
         f"  Жалоб: {s['reports_total']}\n"
         f"  За 24ч: {s['reports_24h']}\n"
@@ -2455,12 +2553,579 @@ async def _vk_parse_target_id(arg: str) -> int | None:
     return None
 
 
+# ============= РЕДАКТИРОВАНИЕ АНКЕТЫ VK =============
+# Юзер нажал «✏️ Редактировать анкету» → появляется inline-меню с полями.
+
+def _vedit_menu_kb() -> VkKeyboard:
+    """Клавиатура меню редактирования VK.
+    ВНИМАНИЕ: у inline-клавиатур VK лимит — не более 6 рядов и не более
+    5 кнопок в ряду. Иначе получим ошибку [911] Keyboard format is invalid."""
+    kb = VkKeyboard(inline=True)
+    # Ряд 1: Имя + Возраст
+    kb.add_callback_button("✏️ Имя", payload={"cmd": "vedit_field", "f": "name"})
+    kb.add_callback_button("🎂 Возраст", payload={"cmd": "vedit_field", "f": "age"})
+    kb.add_line()
+    # Ряд 2: Диапазон партнёра + Город
+    kb.add_callback_button("🔎 Партнёр",
+                            payload={"cmd": "vedit_field", "f": "age_range"})
+    kb.add_callback_button("📍 Город", payload={"cmd": "vedit_field", "f": "city"})
+    kb.add_line()
+    # Ряд 3: Конфессия + Церковь
+    kb.add_callback_button("✝️ Конфессия",
+                            payload={"cmd": "vedit_field", "f": "denomination"})
+    kb.add_callback_button("⛪ Церковь",
+                            payload={"cmd": "vedit_field", "f": "church"})
+    kb.add_line()
+    # Ряд 4: Служение + Работа
+    kb.add_callback_button("🙏 Служение",
+                            payload={"cmd": "vedit_field", "f": "church_role"})
+    kb.add_callback_button("💼 Работа",
+                            payload={"cmd": "vedit_field", "f": "job"})
+    kb.add_line()
+    # Ряд 5: Семейное + Дети
+    kb.add_callback_button("💍 Семейное",
+                            payload={"cmd": "vedit_field", "f": "marital"})
+    kb.add_callback_button("👶 Дети",
+                            payload={"cmd": "vedit_field", "f": "children"})
+    kb.add_line()
+    # Ряд 6: О себе + Фото + Готово
+    kb.add_callback_button("📝 О себе",
+                            payload={"cmd": "vedit_field", "f": "hobbies"})
+    kb.add_callback_button("📷 Фото",
+                            payload={"cmd": "vedit_field", "f": "photos"})
+    kb.add_callback_button("✅ Готово", color=VkKeyboardColor.POSITIVE,
+                            payload={"cmd": "vedit_close"})
+    return kb
+
+
+def _vedit_cancel_kb() -> VkKeyboard:
+    """Кнопка «Отмена» — вернуться в меню редактирования."""
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("◀ Отмена", color=VkKeyboardColor.NEGATIVE,
+                            payload={"cmd": "vedit_cancel"})
+    return kb
+
+
+def _vedit_denom_kb() -> VkKeyboard:
+    """Клавиатура выбора конфессии."""
+    kb = VkKeyboard(inline=True)
+    for i, d in enumerate(DENOMINATIONS):
+        kb.add_callback_button(d, payload={"cmd": "vedit_denom", "i": i})
+        if i % 2 == 1 and i < len(DENOMINATIONS) - 1:
+            kb.add_line()
+    kb.add_line()
+    kb.add_callback_button("Другое (написать своё)",
+                            payload={"cmd": "vedit_denom", "i": -1})
+    kb.add_line()
+    kb.add_callback_button("◀ Отмена", color=VkKeyboardColor.NEGATIVE,
+                            payload={"cmd": "vedit_cancel"})
+    return kb
+
+
+def _vedit_marital_kb(gender: str) -> VkKeyboard:
+    """Клавиатура выбора семейного положения."""
+    single_label = "Не женат" if gender == "M" else "Не замужем"
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button(single_label,
+                            payload={"cmd": "vedit_marital", "v": single_label})
+    kb.add_line()
+    kb.add_callback_button("В разводе",
+                            payload={"cmd": "vedit_marital", "v": "В разводе"})
+    kb.add_line()
+    kb.add_callback_button("Вдовец / Вдова",
+                            payload={"cmd": "vedit_marital", "v": "Вдовец / Вдова"})
+    kb.add_line()
+    kb.add_callback_button("◀ Отмена", color=VkKeyboardColor.NEGATIVE,
+                            payload={"cmd": "vedit_cancel"})
+    return kb
+
+
+def _vedit_children_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("Нет детей",
+                            payload={"cmd": "vedit_children", "v": "Нет детей"})
+    kb.add_line()
+    kb.add_callback_button("Есть, живут со мной",
+                            payload={"cmd": "vedit_children",
+                                     "v": "Есть, живут со мной"})
+    kb.add_line()
+    kb.add_callback_button("Есть, живут отдельно",
+                            payload={"cmd": "vedit_children",
+                                     "v": "Есть, живут отдельно"})
+    kb.add_line()
+    kb.add_callback_button("◀ Отмена", color=VkKeyboardColor.NEGATIVE,
+                            payload={"cmd": "vedit_cancel"})
+    return kb
+
+
+def _vedit_job_kb() -> VkKeyboard:
+    kb = VkKeyboard(inline=True)
+    kb.add_callback_button("🗑 Убрать (не указывать)",
+                            payload={"cmd": "vedit_job_clear"})
+    kb.add_line()
+    kb.add_callback_button("◀ Отмена", color=VkKeyboardColor.NEGATIVE,
+                            payload={"cmd": "vedit_cancel"})
+    return kb
+
+
+async def _vedit_show_menu(vk_user_id: int):
+    """Показать главное меню редактирования."""
+    send_message(
+        vk_user_id,
+        "✏️ Редактирование анкеты\n\nВыбери, что изменить:",
+        keyboard=_vedit_menu_kb(),
+    )
+
+
+async def handle_vedit_callback(vk_user_id: int, payload: dict):
+    """Обработка кнопок редактирования VK."""
+    cmd = payload.get("cmd")
+
+    # Проверка что анкета есть
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    u = await db.get_user(db_id)
+    if not u:
+        send_message(vk_user_id, "Анкеты нет. Напиши «Начать» чтобы создать.")
+        return
+
+    if cmd == "vedit_open":
+        set_state(vk_user_id, None)
+        await _vedit_show_menu(vk_user_id)
+        return
+
+    if cmd == "vedit_close":
+        set_state(vk_user_id, None)
+        send_message(vk_user_id, "✅ Редактирование завершено.",
+                     keyboard=await menu_for_vk(vk_user_id))
+        return
+
+    if cmd == "vedit_cancel":
+        set_state(vk_user_id, None)
+        await _vedit_show_menu(vk_user_id)
+        return
+
+    if cmd == "vedit_field":
+        field = payload.get("f")
+        if field == "name":
+            set_state(vk_user_id, "vedit_name")
+            send_message(vk_user_id,
+                         "✏️ Пришли новое имя (2-30 символов):",
+                         keyboard=_vedit_cancel_kb())
+        elif field == "age":
+            set_state(vk_user_id, "vedit_age")
+            send_message(vk_user_id,
+                         "🎂 Пришли новый возраст (18-99):",
+                         keyboard=_vedit_cancel_kb())
+        elif field == "age_range":
+            set_state(vk_user_id, "vedit_age_min")
+            send_message(vk_user_id,
+                         "🔎 Диапазон возраста партнёра.\n\n"
+                         "Сначала пришли минимальный возраст (например 22):",
+                         keyboard=_vedit_cancel_kb())
+        elif field == "city":
+            set_state(vk_user_id, "vedit_city")
+            send_message(vk_user_id,
+                         "📍 Пришли новый город (2-50 символов):",
+                         keyboard=_vedit_cancel_kb())
+        elif field == "denomination":
+            send_message(vk_user_id, "✝️ Выбери конфессию:",
+                         keyboard=_vedit_denom_kb())
+        elif field == "church":
+            set_state(vk_user_id, "vedit_church")
+            send_message(vk_user_id,
+                         "⛪ Пришли название церкви (2-100 символов):",
+                         keyboard=_vedit_cancel_kb())
+        elif field == "church_role":
+            set_state(vk_user_id, "vedit_church_role")
+            send_message(vk_user_id,
+                         "🙏 Пришли своё служение в церкви (2-100 символов):",
+                         keyboard=_vedit_cancel_kb())
+        elif field == "job":
+            set_state(vk_user_id, "vedit_job")
+            send_message(vk_user_id,
+                         "💼 Пришли кем работаешь или на кого учишься "
+                         "(2-100 символов).\n\n"
+                         "Или нажми «🗑 Убрать», чтобы поле осталось пустым:",
+                         keyboard=_vedit_job_kb())
+        elif field == "marital":
+            send_message(vk_user_id, "💍 Выбери семейное положение:",
+                         keyboard=_vedit_marital_kb(u["gender"]))
+        elif field == "children":
+            send_message(vk_user_id, "👶 Выбери:",
+                         keyboard=_vedit_children_kb())
+        elif field == "hobbies":
+            set_state(vk_user_id, "vedit_hobbies")
+            send_message(vk_user_id,
+                         "📝 Пришли новое описание «О себе» "
+                         "(10-500 символов):",
+                         keyboard=_vedit_cancel_kb())
+        elif field == "photos":
+            set_state(vk_user_id, "vedit_photos", vedit_new_photos=[])
+            send_message(vk_user_id,
+                         "📷 Загрузить фото заново\n\n"
+                         "Пришли 2-5 фотографий (по одной или сразу).\n"
+                         "Старые фото будут заменены на новые.\n\n"
+                         "Когда закончишь — нажми «Готово» "
+                         "(появится после 2-х фото).",
+                         keyboard=_vedit_cancel_kb())
+        return
+
+    if cmd == "vedit_denom":
+        idx = payload.get("i", -1)
+        if idx == -1:
+            # «Другое» — просим ввести
+            set_state(vk_user_id, "vedit_denomination_other")
+            send_message(vk_user_id,
+                         "Напиши название конфессии (2-50 символов):",
+                         keyboard=_vedit_cancel_kb())
+            return
+        if 0 <= idx < len(DENOMINATIONS):
+            denom = DENOMINATIONS[idx]
+            await db.update_profile_fields(db_id, denomination=denom)
+            send_message(vk_user_id, f"✅ Конфессия: {denom}")
+            await _vedit_show_menu(vk_user_id)
+        return
+
+    if cmd == "vedit_marital":
+        value = payload.get("v", "")
+        await db.update_profile_fields(db_id, marital=value)
+        send_message(vk_user_id, f"✅ Сохранено: {value}")
+        await _vedit_show_menu(vk_user_id)
+        return
+
+    if cmd == "vedit_children":
+        value = payload.get("v", "")
+        await db.update_profile_fields(db_id, children=value)
+        send_message(vk_user_id, f"✅ Сохранено: {value}")
+        await _vedit_show_menu(vk_user_id)
+        return
+
+    if cmd == "vedit_job_clear":
+        await db.update_profile_fields(db_id, job=None)
+        send_message(vk_user_id, "✅ Убрано.")
+        await _vedit_show_menu(vk_user_id)
+        return
+
+    if cmd == "vedit_photos_done":
+        data = get_data(vk_user_id)
+        new_photos = data.get("vedit_new_photos", [])
+        if len(new_photos) < 2:
+            send_message(vk_user_id, "Нужно минимум 2 фото!")
+            return
+        await _vedit_finalize_photos(vk_user_id, new_photos)
+        return
+
+
+async def _vedit_finalize_photos(vk_user_id: int, new_photos: list):
+    """Финализация загрузки фото — перемещаем в основную папку, обновляем БД."""
+    import shutil
+    db_id = db.vk_id_to_db_id(vk_user_id)
+
+    # 1. Очищаем основную папку
+    main_dir = db.user_photos_dir(db_id)
+    if os.path.exists(main_dir):
+        try:
+            for f in os.listdir(main_dir):
+                fp = os.path.join(main_dir, f)
+                if os.path.isfile(fp):
+                    os.remove(fp)
+        except Exception as e:
+            log.warning(f"vedit photos: не смог очистить: {e}")
+    os.makedirs(main_dir, exist_ok=True)
+
+    # 2. Перемещаем новые из /tmp
+    final_photos = []
+    for idx, p in enumerate(new_photos):
+        src = p.get("file_path")
+        target = os.path.join(main_dir, f"{idx}.jpg")
+        if src and os.path.exists(src):
+            try:
+                shutil.move(src, target)
+                final_photos.append({"photo_id": p.get("photo_id"),
+                                      "file_path": target})
+            except Exception as e:
+                log.warning(f"vedit move failed: {e}")
+
+    # 3. Удаляем tmp
+    tmp_dir = os.path.join("/tmp", f"vedit_photos_{abs(db_id)}")
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    # 4. Обновляем БД
+    await db.replace_user_photos(db_id, final_photos)
+
+    set_state(vk_user_id, None)
+    send_message(vk_user_id,
+                 f"✅ Фото обновлены ({len(final_photos)} шт.)")
+    await _vedit_show_menu(vk_user_id)
+
+
+# ---- Обработчики ввода текста для полей ----
+
+async def handle_vedit_name(vk_user_id: int, text: str):
+    name = (text or "").strip()
+    if not (2 <= len(name) <= 30):
+        send_message(vk_user_id, "Имя от 2 до 30 символов.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, name=name)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Имя: {name}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_age(vk_user_id: int, text: str):
+    txt = (text or "").strip()
+    if not txt.isdigit() or not (18 <= int(txt) <= 99):
+        send_message(vk_user_id, "Возраст — число от 18 до 99.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, age=int(txt))
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Возраст: {txt}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_age_min(vk_user_id: int, text: str):
+    txt = (text or "").strip()
+    if not txt.isdigit() or not (18 <= int(txt) <= 99):
+        send_message(vk_user_id, "Возраст — число от 18 до 99.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    update_data(vk_user_id, vedit_age_min=int(txt))
+    set_state(vk_user_id, "vedit_age_max")
+    send_message(vk_user_id,
+                 f"Минимум: {txt}.\n\nТеперь пришли максимальный возраст:",
+                 keyboard=_vedit_cancel_kb())
+
+
+async def handle_vedit_age_max(vk_user_id: int, text: str):
+    txt = (text or "").strip()
+    if not txt.isdigit() or not (18 <= int(txt) <= 99):
+        send_message(vk_user_id, "Возраст — число от 18 до 99.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    max_age = int(txt)
+    data = get_data(vk_user_id)
+    min_age = data.get("vedit_age_min", 18)
+    if max_age < min_age:
+        send_message(vk_user_id,
+                     f"Максимум не может быть меньше минимума ({min_age}).",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id,
+                                    partner_age_min=min_age,
+                                    partner_age_max=max_age)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Диапазон: {min_age}–{max_age}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_city(vk_user_id: int, text: str):
+    city = (text or "").strip()
+    if not (2 <= len(city) <= 50):
+        send_message(vk_user_id, "Город от 2 до 50 символов.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, city=city)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Город: {city}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_denom_other(vk_user_id: int, text: str):
+    denom = (text or "").strip()
+    if not (2 <= len(denom) <= 50):
+        send_message(vk_user_id, "От 2 до 50 символов.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, denomination=denom)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Конфессия: {denom}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_church(vk_user_id: int, text: str):
+    ch = (text or "").strip()
+    if not (2 <= len(ch) <= 100):
+        send_message(vk_user_id, "От 2 до 100 символов.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, church=ch)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Церковь: {ch}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_church_role(vk_user_id: int, text: str):
+    role = (text or "").strip()
+    if not (2 <= len(role) <= 100):
+        send_message(vk_user_id, "От 2 до 100 символов.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, church_role=role)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Служение: {role}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_job(vk_user_id: int, text: str):
+    job = (text or "").strip()
+    if not (2 <= len(job) <= 100):
+        send_message(vk_user_id, "От 2 до 100 символов.",
+                     keyboard=_vedit_job_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, job=job)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, f"✅ Работа/учёба: {job}")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_hobbies(vk_user_id: int, text: str):
+    hobbies = (text or "").strip()
+    if not (10 <= len(hobbies) <= 500):
+        send_message(vk_user_id, "От 10 до 500 символов.",
+                     keyboard=_vedit_cancel_kb())
+        return
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    await db.update_profile_fields(db_id, hobbies=hobbies)
+    set_state(vk_user_id, None)
+    send_message(vk_user_id, "✅ Описание обновлено.")
+    await _vedit_show_menu(vk_user_id)
+
+
+async def handle_vedit_photo(vk_user_id: int, attachments: list):
+    """Приём фото при редактировании — накапливаем."""
+    if not attachments:
+        send_message(vk_user_id, "Пришли фото (не текст).",
+                     keyboard=_vedit_cancel_kb())
+        return
+    # Ищем фото среди вложений
+    photo_att = None
+    for att in attachments:
+        if att.get("type") == "photo":
+            photo_att = att.get("photo")
+            break
+    if not photo_att:
+        send_message(vk_user_id, "Пришли фото (не текст, не документ).",
+                     keyboard=_vedit_cancel_kb())
+        return
+
+    data = get_data(vk_user_id)
+    new_photos = data.get("vedit_new_photos", [])
+    if len(new_photos) >= 5:
+        send_message(vk_user_id, "Уже 5 фото — больше не нужно. Нажми «Готово».")
+        return
+
+    db_id = db.vk_id_to_db_id(vk_user_id)
+    tmp_dir = os.path.join("/tmp", f"vedit_photos_{abs(db_id)}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    pos = len(new_photos)
+    tmp_path = os.path.join(tmp_dir, f"{pos}.jpg")
+
+    # Скачиваем фото из VK (берём наибольший размер)
+    sizes = photo_att.get("sizes", [])
+    if not sizes:
+        send_message(vk_user_id, "Не смог обработать фото. Попробуй ещё раз.")
+        return
+    biggest = max(sizes, key=lambda s: s.get("width", 0) * s.get("height", 0))
+    url = biggest.get("url")
+
+    ok = await _download_url_to_file(url, tmp_path)
+    if not ok:
+        send_message(vk_user_id, "Не смог скачать фото. Попробуй ещё раз.")
+        return
+
+    new_photos.append({"photo_id": f"vk_photo_{photo_att.get('id')}",
+                        "file_path": tmp_path})
+    update_data(vk_user_id, vedit_new_photos=new_photos)
+
+    count = len(new_photos)
+    if count < 2:
+        send_message(vk_user_id,
+                     f"Принято {count}/5. Нужно ещё минимум одно.",
+                     keyboard=_vedit_cancel_kb())
+    else:
+        kb = VkKeyboard(inline=True)
+        kb.add_callback_button(f"✅ Готово ({count}/5)",
+                                color=VkKeyboardColor.POSITIVE,
+                                payload={"cmd": "vedit_photos_done"})
+        kb.add_line()
+        kb.add_callback_button("◀ Отмена", color=VkKeyboardColor.NEGATIVE,
+                                payload={"cmd": "vedit_cancel"})
+        send_message(vk_user_id,
+                     f"Принято {count}/5. Можно добавить ещё или нажать «Готово».",
+                     keyboard=kb)
+
+
+async def _download_url_to_file(url: str, target_path: str) -> bool:
+    """Скачивает URL в файл. Возвращает True если успешно."""
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession() as sess:
+            async with sess.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    return False
+                content = await resp.read()
+                with open(target_path, "wb") as f:
+                    f.write(content)
+                return True
+    except Exception as e:
+        log.warning(f"download {url} failed: {e}")
+        return False
+
+
 async def deliver_pending_notifications_vk():
     """Раз в 3 секунды смотрим очередь pending_notifications.
     VK-бот доставляет:
       - match для VK-получателей (TG-получателей возьмёт TG-бот)
       - system_message для VK-получателей (бан/разбан и т.п.)
-      - broadcast для VK-получателей (рассылка от админа)"""
+      - broadcast для VK-получателей (рассылка от админа)
+
+    Правила устойчивой доставки:
+      - Для broadcast — 4 сообщения/сек (250мс задержка), чтобы не поймать
+        HTTP 429 «Too Many Requests».
+      - Для broadcast — если HTTP 429 → пауза 60 сек и НЕ помечаем как
+        delivered (попробуем в следующей итерации).
+      - Для 901 (нет прав) / 936 (не найден) — считаем как «доставлено»
+        (реально ничего не поделаешь).
+      - Прочие ошибки VK-API (500/504) — retry в следующей итерации.
+      - Каждые 50 отправленных broadcast'ов — лог с прогрессом."""
+
+    # Счётчики за текущий батч broadcast'ов — для итоговой статистики в логах
+    bc_ok = 0
+    bc_no_perm = 0        # 901
+    bc_not_found = 0      # 936
+    bc_retry_later = 0
+    _bc_batch_id = None
+
+    def _bc_log_if_batch_done(current_bid):
+        """Если сменилась пачка broadcast'ов — логируем итог предыдущей."""
+        nonlocal bc_ok, bc_no_perm, bc_not_found, bc_retry_later, _bc_batch_id
+        if _bc_batch_id is not None and current_bid != _bc_batch_id:
+            log.info(
+                f"[broadcast] Batch {_bc_batch_id} итог: "
+                f"✅ доставлено {bc_ok}, "
+                f"⛔ 901 (нет прав) {bc_no_perm}, "
+                f"❌ 936 (не найден) {bc_not_found}, "
+                f"⏳ на повтор {bc_retry_later}"
+            )
+            bc_ok = 0
+            bc_no_perm = 0
+            bc_not_found = 0
+            bc_retry_later = 0
+        _bc_batch_id = current_bid
+
     while True:
         try:
             notifications = await db.get_pending_notifications(
@@ -2471,10 +3136,21 @@ async def deliver_pending_notifications_vk():
                 if recipient is None or not db.is_vk_user(recipient):
                     # Не наш — не трогаем (доставит TG-бот)
                     continue
+
+                # Пробуем сконвертировать recipient в vk_uid.
+                # Если тут упадём — просто пропускаем запись целиком.
                 try:
                     vk_uid = db.db_id_to_vk_id(recipient)
+                except Exception as e:
+                    log.warning(f"Плохой recipient_id {recipient}: {e}")
+                    await db.mark_notification_delivered(n["id"])
+                    continue
 
-                    if n["kind"] == "match":
+                kind = n["kind"]
+
+                # ---- match ----
+                if kind == "match":
+                    try:
                         partner_id = n["partner_id"]
                         partner = await db.get_user(partner_id)
                         if not partner:
@@ -2487,31 +3163,125 @@ async def deliver_pending_notifications_vk():
                         )
                         attachment = None
                         if partner.get("photo_path") and os.path.exists(partner["photo_path"]):
-                            attachment = upload_photo_to_messages(
-                                partner["photo_path"], vk_uid,
-                            )
+                            try:
+                                attachment = upload_photo_to_messages(
+                                    partner["photo_path"], vk_uid,
+                                )
+                            except Exception as e:
+                                log.warning(f"match photo upload failed: {e}")
+                                attachment = None
                         send_message(vk_uid, text, attachment=attachment)
+                        await db.mark_notification_delivered(n["id"])
+                    except Exception as e:
+                        log.warning(f"match delivery {n['id']} failed: {e}")
+                        # Помечаем чтоб не крутить дальше (match важен, но
+                        # без обратной связи VK лучше не спамить)
+                        await db.mark_notification_delivered(n["id"])
+                    continue
 
-                    elif n["kind"] == "system_message":
+                # ---- system_message ----
+                if kind == "system_message":
+                    try:
                         import json
                         payload = json.loads(n["payload"] or "{}")
                         text = payload.get("text", "")
                         if text:
                             send_message(vk_uid, text)
+                        await db.mark_notification_delivered(n["id"])
+                    except Exception as e:
+                        log.warning(f"system_message {n['id']} failed: {e}")
+                        await db.mark_notification_delivered(n["id"])
+                    continue
 
-                    elif n["kind"] == "broadcast":
+                # ---- broadcast ----
+                if kind == "broadcast":
+                    try:
                         import json
                         payload = json.loads(n["payload"] or "{}")
                         text = payload.get("text", "")
-                        if text:
-                            send_message(vk_uid, text)
-                        # Лимит ~20 сообщений/сек на доставку рассылок
-                        await asyncio.sleep(0.05)
+                        current_bid = payload.get("batch_id")
+                        _bc_log_if_batch_done(current_bid)
 
-                    await db.mark_notification_delivered(n["id"])
-                except Exception as e:
-                    log.exception(f"Доставка VK-уведомления {n['id']} упала: {e}")
-                    await db.mark_notification_delivered(n["id"])
+                        if not text:
+                            # Пустой текст — считаем «доставленным» (нечего слать)
+                            log.warning(f"broadcast {n['id']}: пустой текст, пропускаю")
+                            await db.mark_notification_delivered(n["id"])
+                            continue
+
+                        # Отправка. Проверяем результат — send_message возвращает
+                        # message_id или None (если ApiError типа 901/936).
+                        result = None
+                        vk_error_code = None
+                        try:
+                            # Прямой вызов vk API — чтобы обработать
+                            # HTTPError (429/500/504), которые send_message
+                            # не ловит и пробрасывает вверх.
+                            result = vk.messages.send(
+                                user_id=vk_uid,
+                                message=text,
+                                random_id=random.randint(1, 2**31 - 1),
+                            )
+                        except vk_api.exceptions.ApiError as e:
+                            # 901, 936 и т.п. — юзеру недоставимо, но
+                            # не потому что API сломано. Считаем «обработано».
+                            err_str = str(e)
+                            if "[901]" in err_str:
+                                bc_no_perm += 1
+                                vk_error_code = 901
+                            elif "[936]" in err_str:
+                                bc_not_found += 1
+                                vk_error_code = 936
+                            else:
+                                log.warning(
+                                    f"broadcast {n['id']} to {vk_uid}: "
+                                    f"ApiError {err_str}"
+                                )
+                                # Другие API-ошибки — тоже помечаем, дальше не пытаемся
+                                vk_error_code = -1
+                        except vk_api.exceptions.ApiHttpError as e:
+                            # HTTP 429/500/504 — VK API временно недоступен
+                            err_str = str(e)
+                            if "429" in err_str:
+                                # Rate limit — стоп на 60 сек, НЕ помечаем
+                                log.warning(
+                                    f"broadcast {n['id']}: HTTP 429 rate limit, "
+                                    f"пауза 60сек, запись остаётся в очереди"
+                                )
+                                bc_retry_later += 1
+                                await asyncio.sleep(60)
+                                # НЕ помечаем — попробуем в следующем цикле
+                                break
+                            else:
+                                # 500/504 — тоже не помечаем, повторим позже
+                                log.warning(
+                                    f"broadcast {n['id']}: HTTP error {err_str}, "
+                                    f"попробуем позже"
+                                )
+                                bc_retry_later += 1
+                                await asyncio.sleep(10)
+                                break
+                        except Exception as e:
+                            # Любая другая ошибка — логируем и помечаем
+                            log.exception(f"broadcast {n['id']} unexpected: {e}")
+
+                        if result:
+                            bc_ok += 1
+
+                        # Помечаем как обработано (кроме случая HTTP 429/500 выше)
+                        await db.mark_notification_delivered(n["id"])
+
+                        # Rate limit: 4 сообщения/сек = 250мс задержка
+                        await asyncio.sleep(0.25)
+
+                    except Exception as e:
+                        log.exception(f"broadcast {n['id']} outer error: {e}")
+                        # Не помечаем — вдруг это временная беда
+                        await asyncio.sleep(1)
+                        break
+
+            # Логируем итог последнего batch'а, если он есть
+            _bc_log_if_batch_done(None)
+
         except Exception as e:
             log.exception(f"deliver loop error: {e}")
         await asyncio.sleep(3)

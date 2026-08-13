@@ -742,7 +742,7 @@ async def get_stats() -> dict:
               )
         """)
 
-        # ---- ТОП ГОРОДОВ И ЦЕРКВЕЙ ----
+        # ---- ТОП ГОРОДОВ ----
         rows = await _list("""
             SELECT city, COUNT(*) as cnt FROM users
             GROUP BY LOWER(TRIM(city))
@@ -750,12 +750,71 @@ async def get_stats() -> dict:
         """)
         stats["top_cities"] = [(r[0], r[1]) for r in rows]
 
-        rows = await _list("""
-            SELECT church, COUNT(*) as cnt FROM users
-            GROUP BY LOWER(TRIM(church))
-            ORDER BY cnt DESC LIMIT 5
+        # ---- КОНФЕССИИ (полный список стандартных + топ «Другое») ----
+        # Стандартный список конфессий, как в анкете
+        STANDARD_DENOMS = [
+            "Баптисты", "Пятидесятники", "АСД",
+            "Евангельские Христиане", "Лютеране", "Православные",
+            "Католики", "Методисты", "Пресвитериане",
+        ]
+
+        # Считаем каждую стандартную с разбивкой по полу.
+        # Игнорируем регистр и пробелы, чтобы 'баптисты  ' и 'Баптисты' считались вместе.
+        denom_stats = []  # [(name, total, male, female)]
+        for name in STANDARD_DENOMS:
+            cur = await conn.execute("""
+                SELECT
+                    COUNT(*) as cnt,
+                    SUM(CASE WHEN gender='M' THEN 1 ELSE 0 END) as male,
+                    SUM(CASE WHEN gender='F' THEN 1 ELSE 0 END) as female
+                FROM users
+                WHERE LOWER(TRIM(denomination)) = LOWER(?)
+            """, (name,))
+            row = await cur.fetchone()
+            total = row[0] or 0
+            male = row[1] or 0
+            female = row[2] or 0
+            denom_stats.append((name, total, male, female))
+        # Сортируем по числу пользователей (по убыванию)
+        denom_stats.sort(key=lambda x: -x[1])
+        stats["denominations"] = denom_stats
+
+        # «Другое» — конфессии, не входящие в стандартный список.
+        # Считаем общее число и берём топ-10 самых частых.
+        placeholders = ",".join("LOWER(?)" for _ in STANDARD_DENOMS)
+        params = tuple(STANDARD_DENOMS)
+
+        # Общее число «Другое» (не пустые + не стандартные)
+        cur = await conn.execute(f"""
+            SELECT COUNT(*) FROM users
+            WHERE denomination IS NOT NULL
+              AND TRIM(denomination) != ''
+              AND LOWER(TRIM(denomination)) NOT IN ({placeholders})
+        """, params)
+        row = await cur.fetchone()
+        stats["denom_other_total"] = row[0] if row and row[0] else 0
+
+        # Топ-10 самых частых в «Другом»
+        cur = await conn.execute(f"""
+            SELECT TRIM(denomination) as d, COUNT(*) as cnt
+            FROM users
+            WHERE denomination IS NOT NULL
+              AND TRIM(denomination) != ''
+              AND LOWER(TRIM(denomination)) NOT IN ({placeholders})
+            GROUP BY LOWER(TRIM(denomination))
+            ORDER BY cnt DESC
+            LIMIT 10
+        """, params)
+        rows = await cur.fetchall()
+        stats["denom_other_top"] = [(r[0], r[1]) for r in rows]
+
+        # Число юзеров вообще без указания конфессии
+        cur = await conn.execute("""
+            SELECT COUNT(*) FROM users
+            WHERE denomination IS NULL OR TRIM(denomination) = ''
         """)
-        stats["top_churches"] = [(r[0], r[1]) for r in rows]
+        row = await cur.fetchone()
+        stats["denom_not_set"] = row[0] if row and row[0] else 0
 
         # ---- МОДЕРАЦИЯ ----
         stats["reports_total"] = await _one("SELECT COUNT(*) FROM reports")
@@ -1531,3 +1590,35 @@ async def get_all_moderator_ids() -> set[int]:
             "SELECT user_id FROM admins WHERE role = 'moderator'"
         )
         return {r[0] for r in await cur.fetchall()}
+
+
+async def replace_user_photos(user_id: int, photos: list) -> None:
+    """Полностью заменяет фото пользователя (для функции редактирования).
+
+    photos — список [{photo_id, file_path}, ...] максимум 5 штук.
+    Первый элемент становится обложкой (photo_id/photo_path в таблице users).
+    Старые записи из user_photos удаляются перед вставкой новых.
+
+    Файлы на диске должны быть уже перемещены на нужные места ДО вызова
+    этой функции (см. bot.py edit_photos_done)."""
+    if not photos:
+        return
+    async with aiosqlite.connect(DB_PATH) as conn:
+        # Удаляем старые записи
+        await conn.execute(
+            "DELETE FROM user_photos WHERE user_id = ?", (user_id,)
+        )
+        # Вставляем новые
+        for pos, p in enumerate(photos[:5]):
+            await conn.execute(
+                "INSERT INTO user_photos (user_id, position, photo_id, file_path) "
+                "VALUES (?, ?, ?, ?)",
+                (user_id, pos, p.get("photo_id"), p.get("file_path")),
+            )
+        # Обновляем обложку в основной таблице users
+        cover = photos[0]
+        await conn.execute(
+            "UPDATE users SET photo_id = ?, photo_path = ? WHERE user_id = ?",
+            (cover.get("photo_id"), cover.get("file_path"), user_id),
+        )
+        await conn.commit()

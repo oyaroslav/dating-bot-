@@ -399,6 +399,25 @@ class AssignRoleForm(StatesGroup):
     waiting_target = State()
 
 
+class EditProfileForm(StatesGroup):
+    """FSM редактирования анкеты — одно поле за раз."""
+    # Каждое поле — своё состояние (чтобы после ввода вернуться в меню)
+    edit_name = State()
+    edit_age = State()
+    edit_age_min = State()      # мин возраст партнёра
+    edit_age_max = State()      # макс возраст партнёра
+    edit_city = State()
+    edit_denomination = State()
+    edit_denomination_other = State()  # если выбрано «Другое»
+    edit_church = State()
+    edit_church_role = State()
+    edit_job = State()
+    edit_marital = State()
+    edit_children = State()
+    edit_hobbies = State()
+    edit_photos = State()        # загрузка фото
+
+
 # ----------- Список конфессий -----------
 DENOMINATIONS = [
     "Баптисты", "Пятидесятники", "АСД",
@@ -1677,6 +1696,27 @@ async def my_profile(message: Message, state: FSMContext):
     if not photos:
         photos = [{"photo_id": u["photo_id"], "file_path": u.get("photo_path")}]
 
+    # Фильтруем только валидные фото:
+    # - файл существует на диске
+    # - файл не пустой (>0 байт)
+    # Если файла нет/битый — оставляем photo_id (Telegram-кеш) как fallback
+    valid_photos = []
+    for p in photos:
+        fp = p.get("file_path")
+        if fp and _os.path.exists(fp) and _os.path.getsize(fp) > 0:
+            valid_photos.append(p)
+        elif p.get("photo_id"):
+            # Оставляем словарь с file_path=None — photo_source возьмёт photo_id
+            valid_photos.append({"photo_id": p["photo_id"], "file_path": None})
+    if not valid_photos:
+        # Совсем никаких фото не осталось (странно, но такое бывает)
+        await message.answer(
+            "⚠️ Не могу показать твои фото — файлы утеряны.\n"
+            "Нажми «✏️ Редактировать» → «Фото» и загрузи заново.",
+            reply_markup=await menu_for(message.from_user.id),
+        )
+        return
+
     # К стандартной подписи добавляем личный фильтр по возрасту партнёра
     # (его видит только сам пользователь — другим это не показывается)
     caption = format_profile(u)
@@ -1691,20 +1731,63 @@ async def my_profile(message: Message, state: FSMContext):
         caption += "\n\n👁 <b>Анкета скрыта</b> — сейчас её никто не видит."
         kb = hidden_menu_kb()
     else:
-        kb = main_menu_kb()
+        kb = await menu_for(message.from_user.id)
 
-    if len(photos) == 1:
-        src = photo_source_from_dict(photos[0])
-        await message.answer_photo(src, caption=caption, reply_markup=kb)
+    # Отправка фото. Стратегия — устойчивая к ошибкам Telegram:
+    # если media_group упадёт (например IMAGE_PROCESS_FAILED),
+    # шлём каждое фото отдельно.
+    async def _send_single(idx: int, photo: dict, cap: str | None) -> bool:
+        """Возвращает True если удалось отправить."""
+        # 1. Пробуем локальный файл
+        src = photo_source_from_dict(photo)
+        try:
+            await message.answer_photo(src, caption=cap)
+            return True
+        except Exception as e1:
+            logging.warning(f"my_profile photo {idx} FS failed: {e1}")
+            # 2. Fallback: photo_id (кеш Telegram)
+            if photo.get("photo_id"):
+                try:
+                    await message.answer_photo(photo["photo_id"], caption=cap)
+                    return True
+                except Exception as e2:
+                    logging.warning(f"my_profile photo {idx} ID failed: {e2}")
+        return False
+
+    edit_kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✏️ Редактировать анкету",
+                              callback_data="edit:open"),
+    ]])
+
+    if len(valid_photos) == 1:
+        ok = await _send_single(0, valid_photos[0], caption)
+        if not ok:
+            await message.answer(caption)
+        await message.answer("Что дальше?", reply_markup=edit_kb)
+        # Основное меню
+        await message.answer("Меню:", reply_markup=kb)
     else:
-        # Медиа-группа: подпись на первом фото
-        media = [InputMediaPhoto(media=photo_source_from_dict(photos[0]),
-                                 caption=caption, parse_mode="HTML")]
-        for p in photos[1:]:
-            media.append(InputMediaPhoto(media=photo_source_from_dict(p)))
-        await message.answer_media_group(media)
-        await message.answer(f"Загружено фото: {len(photos)}.",
-                             reply_markup=kb)
+        # Пытаемся media_group, если не выйдет — по одному
+        try:
+            media = [InputMediaPhoto(media=photo_source_from_dict(valid_photos[0]),
+                                     caption=caption, parse_mode="HTML")]
+            for p in valid_photos[1:]:
+                media.append(InputMediaPhoto(media=photo_source_from_dict(p)))
+            await message.answer_media_group(media)
+        except Exception as e:
+            logging.warning(f"my_profile media_group failed, falling back: {e}")
+            # Fallback: шлём по одному, подпись на первом
+            for i, p in enumerate(valid_photos):
+                cap = caption if i == 0 else None
+                sent = await _send_single(i, p, cap)
+                if not sent and i == 0:
+                    # Хотя бы текст покажем
+                    await message.answer(caption)
+        await message.answer(
+            f"Загружено фото: {len(valid_photos)}.",
+            reply_markup=edit_kb,
+        )
+        await message.answer("Меню:", reply_markup=kb)
 
 
 # ----------- Список матчей -----------
@@ -1867,6 +1950,27 @@ async def cmd_stats(message: Message):
         return "\n".join(f"  {i+1}. {name} — {cnt}"
                          for i, (name, cnt) in enumerate(items))
 
+    # Форматируем конфессии — с разбивкой по полу
+    def fmt_denoms(items: list) -> str:
+        if not items:
+            return "  <i>нет данных</i>"
+        lines = []
+        for i, (name, total, male, female) in enumerate(items, 1):
+            if total == 0:
+                # Показываем даже нули — чтобы был виден весь список
+                lines.append(f"  {i}. {name} — <b>0</b>")
+            else:
+                lines.append(
+                    f"  {i}. {name} — <b>{total}</b> (М: {male} / Ж: {female})"
+                )
+        return "\n".join(lines)
+
+    def fmt_other(items: list) -> str:
+        if not items:
+            return "  <i>нет</i>"
+        return "\n".join(f"  {i+1}. {name} — {cnt}"
+                          for i, (name, cnt) in enumerate(items))
+
     text = (
         "📊 <b>Статистика бота</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -1896,8 +2000,14 @@ async def cmd_stats(message: Message):
         "🏙 <b>Топ городов</b>\n"
         f"{fmt_top(s['top_cities'], 'данных')}\n\n"
 
-        "⛪ <b>Топ церквей</b>\n"
-        f"{fmt_top(s['top_churches'], 'данных')}\n\n"
+        "✝️ <b>Конфессии</b>\n"
+        f"{fmt_denoms(s['denominations'])}\n"
+        f"\n"
+        f"📝 <b>Другое ({s['denom_other_total']})</b>:\n"
+        f"{fmt_other(s['denom_other_top'])}\n"
+        + (f"\n<i>Не указано: {s['denom_not_set']}</i>\n"
+           if s['denom_not_set'] else "")
+        + "\n"
 
         "🛡 <b>Модерация</b>\n"
         f"  Жалоб всего: {s['reports_total']}\n"
@@ -2722,8 +2832,8 @@ async def _run_broadcast(call: CallbackQuery, state: FSMContext):
             elif "user_deactivated" in err or "chat not found" in err:
                 deleted += 1
             logging.warning(f"Broadcast TG to {r['user_id']} failed: {e}")
-        # Лимит ≈20 сообщений/сек
-        await asyncio.sleep(0.05)
+        # Лимит ~10 сообщений/сек — безопасно, Telegram не ругается
+        await asyncio.sleep(0.1)
         # Обновляем прогресс каждые 25 (чтобы не упереться в rate limit edit'ов)
         if (i + 1) % 25 == 0:
             try:
@@ -3209,6 +3319,603 @@ async def admin_menu_back(call: CallbackQuery):
         )
     except Exception:
         pass
+
+
+# ============= РЕДАКТИРОВАНИЕ АНКЕТЫ =============
+# Юзер жмёт «✏️ Редактировать анкету» → появляется меню с полями.
+# Выбирает поле → бот просит новое значение → сохраняет → возвращается в меню.
+
+def _edit_menu_kb() -> InlineKeyboardMarkup:
+    """Клавиатура меню редактирования — список полей."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Имя", callback_data="edit:name"),
+         InlineKeyboardButton(text="🎂 Возраст", callback_data="edit:age")],
+        [InlineKeyboardButton(text="🔎 Возраст партнёра",
+                              callback_data="edit:age_range")],
+        [InlineKeyboardButton(text="📍 Город", callback_data="edit:city"),
+         InlineKeyboardButton(text="✝️ Конфессия", callback_data="edit:denomination")],
+        [InlineKeyboardButton(text="⛪ Церковь", callback_data="edit:church"),
+         InlineKeyboardButton(text="🙏 Служение", callback_data="edit:church_role")],
+        [InlineKeyboardButton(text="💼 Работа/учёба", callback_data="edit:job")],
+        [InlineKeyboardButton(text="💍 Семейное", callback_data="edit:marital"),
+         InlineKeyboardButton(text="👶 Дети", callback_data="edit:children")],
+        [InlineKeyboardButton(text="📝 О себе", callback_data="edit:hobbies")],
+        [InlineKeyboardButton(text="📷 Загрузить фото заново",
+                              callback_data="edit:photos")],
+        [InlineKeyboardButton(text="✅ Готово", callback_data="edit:close")],
+    ])
+
+
+def _edit_cancel_kb() -> InlineKeyboardMarkup:
+    """Кнопка «Отмена» на любом шаге редактирования — вернуться в меню."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀ Отмена", callback_data="edit:cancel_field"),
+    ]])
+
+
+@router.callback_query(F.data == "edit:open")
+async def edit_open(call: CallbackQuery, state: FSMContext):
+    """Открытие меню редактирования — из «Моя анкета»."""
+    u = await db.get_user(call.from_user.id)
+    if not u:
+        await call.answer("Сначала заполни анкету: /start", show_alert=True)
+        return
+    await call.answer()
+    await state.clear()
+    await bot.send_message(
+        call.from_user.id,
+        "✏️ <b>Редактирование анкеты</b>\n\n"
+        "Выбери, что изменить:",
+        reply_markup=_edit_menu_kb(),
+    )
+
+
+@router.callback_query(F.data == "edit:close")
+async def edit_close(call: CallbackQuery, state: FSMContext):
+    """Закрытие меню редактирования."""
+    await call.answer("Готово")
+    await state.clear()
+    try:
+        await call.message.edit_text("✅ Редактирование завершено.")
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "edit:cancel_field")
+async def edit_cancel_field(call: CallbackQuery, state: FSMContext):
+    """Отмена ввода конкретного поля — возврат в меню."""
+    await call.answer()
+    await state.clear()
+    try:
+        await call.message.edit_text(
+            "✏️ <b>Редактирование анкеты</b>\n\nВыбери, что изменить:",
+            reply_markup=_edit_menu_kb(),
+        )
+    except Exception:
+        # если старое сообщение уже не редактируется — шлём новое
+        await bot.send_message(
+            call.from_user.id,
+            "✏️ <b>Редактирование анкеты</b>\n\nВыбери, что изменить:",
+            reply_markup=_edit_menu_kb(),
+        )
+
+
+# ---- Открытие каждого поля ----
+
+@router.callback_query(F.data == "edit:name")
+async def edit_field_name(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_name)
+    await bot.send_message(
+        call.from_user.id,
+        "✏️ Пришли <b>новое имя</b> (2-30 символов):",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+@router.callback_query(F.data == "edit:age")
+async def edit_field_age(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_age)
+    await bot.send_message(
+        call.from_user.id,
+        "🎂 Пришли <b>новый возраст</b> (18-99):",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+@router.callback_query(F.data == "edit:age_range")
+async def edit_field_age_range(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_age_min)
+    await bot.send_message(
+        call.from_user.id,
+        "🔎 Диапазон возраста партнёра.\n\n"
+        "Сначала пришли <b>минимальный возраст</b> (например, 22):",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+@router.callback_query(F.data == "edit:city")
+async def edit_field_city(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_city)
+    await bot.send_message(
+        call.from_user.id,
+        "📍 Пришли <b>новый город</b> (2-50 символов):",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+def _edit_denom_kb() -> InlineKeyboardMarkup:
+    """Клавиатура выбора конфессии."""
+    rows = []
+    for i in range(0, len(DENOMINATIONS), 2):
+        row = [InlineKeyboardButton(text=DENOMINATIONS[i],
+                                     callback_data=f"edit:d:{i}")]
+        if i + 1 < len(DENOMINATIONS):
+            row.append(InlineKeyboardButton(
+                text=DENOMINATIONS[i + 1],
+                callback_data=f"edit:d:{i+1}",
+            ))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Другое (написать своё)",
+                                       callback_data="edit:d:other")])
+    rows.append([InlineKeyboardButton(text="◀ Отмена",
+                                       callback_data="edit:cancel_field")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.callback_query(F.data == "edit:denomination")
+async def edit_field_denomination(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await bot.send_message(
+        call.from_user.id,
+        "✝️ Выбери <b>конфессию</b>:",
+        reply_markup=_edit_denom_kb(),
+    )
+
+
+@router.callback_query(F.data.startswith("edit:d:"))
+async def edit_denom_selected(call: CallbackQuery, state: FSMContext):
+    val = call.data.split(":", 2)[2]
+    if val == "other":
+        await call.answer()
+        await state.set_state(EditProfileForm.edit_denomination_other)
+        await bot.send_message(
+            call.from_user.id,
+            "Напиши <b>название конфессии</b> (2-50 символов):",
+            reply_markup=_edit_cancel_kb(),
+        )
+        return
+    # Выбрана стандартная
+    try:
+        idx = int(val)
+        denom = DENOMINATIONS[idx]
+    except Exception:
+        await call.answer("Ошибка")
+        return
+    await call.answer(f"Сохранено: {denom}")
+    await db.update_profile_fields(call.from_user.id, denomination=denom)
+    await _edit_back_to_menu(call)
+
+
+@router.callback_query(F.data == "edit:church")
+async def edit_field_church(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_church)
+    await bot.send_message(
+        call.from_user.id,
+        "⛪ Пришли <b>название церкви</b> (2-100 символов):",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+@router.callback_query(F.data == "edit:church_role")
+async def edit_field_church_role(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_church_role)
+    await bot.send_message(
+        call.from_user.id,
+        "🙏 Пришли <b>своё служение в церкви</b> (2-100 символов):",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+@router.callback_query(F.data == "edit:job")
+async def edit_field_job(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_job)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Убрать (не указывать)",
+                              callback_data="edit:job:clear")],
+        [InlineKeyboardButton(text="◀ Отмена", callback_data="edit:cancel_field")],
+    ])
+    await bot.send_message(
+        call.from_user.id,
+        "💼 Пришли <b>кем работаешь или на кого учишься</b> (2-100 символов).\n\n"
+        "Или нажми «🗑 Убрать», чтобы поле осталось пустым:",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data == "edit:job:clear")
+async def edit_job_clear(call: CallbackQuery, state: FSMContext):
+    await call.answer("Убрано")
+    await db.update_profile_fields(call.from_user.id, job=None)
+    await _edit_back_to_menu(call)
+
+
+def _edit_marital_kb(gender: str) -> InlineKeyboardMarkup:
+    """Клавиатура выбора семейного положения (с учётом пола)."""
+    single_label = "Не женат" if gender == "M" else "Не замужем"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=single_label,
+                              callback_data=f"edit:m:{single_label}")],
+        [InlineKeyboardButton(text="В разводе",
+                              callback_data="edit:m:В разводе")],
+        [InlineKeyboardButton(text="Вдовец / Вдова",
+                              callback_data="edit:m:Вдовец / Вдова")],
+        [InlineKeyboardButton(text="◀ Отмена", callback_data="edit:cancel_field")],
+    ])
+
+
+@router.callback_query(F.data == "edit:marital")
+async def edit_field_marital(call: CallbackQuery, state: FSMContext):
+    u = await db.get_user(call.from_user.id)
+    if not u:
+        await call.answer()
+        return
+    await call.answer()
+    await bot.send_message(
+        call.from_user.id,
+        "💍 Выбери <b>семейное положение</b>:",
+        reply_markup=_edit_marital_kb(u["gender"]),
+    )
+
+
+@router.callback_query(F.data.startswith("edit:m:"))
+async def edit_marital_selected(call: CallbackQuery, state: FSMContext):
+    value = call.data.split(":", 2)[2]
+    await call.answer(f"Сохранено: {value}")
+    await db.update_profile_fields(call.from_user.id, marital=value)
+    await _edit_back_to_menu(call)
+
+
+@router.callback_query(F.data == "edit:children")
+async def edit_field_children(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Нет детей", callback_data="edit:c:Нет детей")],
+        [InlineKeyboardButton(text="Есть, живут со мной",
+                              callback_data="edit:c:Есть, живут со мной")],
+        [InlineKeyboardButton(text="Есть, живут отдельно",
+                              callback_data="edit:c:Есть, живут отдельно")],
+        [InlineKeyboardButton(text="◀ Отмена", callback_data="edit:cancel_field")],
+    ])
+    await bot.send_message(
+        call.from_user.id,
+        "👶 Выбери:",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("edit:c:"))
+async def edit_children_selected(call: CallbackQuery, state: FSMContext):
+    value = call.data.split(":", 2)[2]
+    await call.answer(f"Сохранено")
+    await db.update_profile_fields(call.from_user.id, children=value)
+    await _edit_back_to_menu(call)
+
+
+@router.callback_query(F.data == "edit:hobbies")
+async def edit_field_hobbies(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_hobbies)
+    await bot.send_message(
+        call.from_user.id,
+        "📝 Пришли <b>новое описание</b> «О себе» (10-500 символов):",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+@router.callback_query(F.data == "edit:photos")
+async def edit_field_photos(call: CallbackQuery, state: FSMContext):
+    await call.answer()
+    await state.set_state(EditProfileForm.edit_photos)
+    await state.update_data(new_photos=[])
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="◀ Отмена", callback_data="edit:cancel_field"),
+    ]])
+    await bot.send_message(
+        call.from_user.id,
+        "📷 <b>Загрузить фото заново</b>\n\n"
+        "Пришли <b>2-5 фотографий</b> (по одной или сразу).\n"
+        "Старые фото будут <b>заменены</b> на новые.\n\n"
+        "Когда закончишь — нажми «✅ Готово» (появится после 2-х фото).",
+        reply_markup=kb,
+    )
+
+
+async def _edit_back_to_menu(call: CallbackQuery):
+    """Возврат в меню редактирования после сохранения одного поля."""
+    try:
+        await bot.send_message(
+            call.from_user.id,
+            "✅ Сохранено. Что ещё изменить?",
+            reply_markup=_edit_menu_kb(),
+        )
+    except Exception:
+        pass
+
+
+# ---- Обработчики ввода текста для каждого поля ----
+
+@router.message(EditProfileForm.edit_name, F.text)
+async def edit_input_name(message: Message, state: FSMContext):
+    name = (message.text or "").strip()
+    if not (2 <= len(name) <= 30):
+        await message.answer("Имя от 2 до 30 символов. Попробуй ещё раз.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, name=name)
+    await state.clear()
+    await message.answer(f"✅ Имя изменено на «{name}». Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+@router.message(EditProfileForm.edit_age, F.text)
+async def edit_input_age(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if not txt.isdigit():
+        await message.answer("Возраст — целое число. Попробуй ещё раз.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    age = int(txt)
+    if not (18 <= age <= 99):
+        await message.answer("Возраст должен быть от 18 до 99.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, age=age)
+    await state.clear()
+    await message.answer(f"✅ Возраст изменён на {age}. Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+@router.message(EditProfileForm.edit_age_min, F.text)
+async def edit_input_age_min(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if not txt.isdigit() or not (18 <= int(txt) <= 99):
+        await message.answer("Возраст — число от 18 до 99. Попробуй ещё раз.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await state.update_data(age_min=int(txt))
+    await state.set_state(EditProfileForm.edit_age_max)
+    await message.answer(
+        f"Минимум: {txt}.\n\nТеперь пришли <b>максимальный возраст</b>:",
+        reply_markup=_edit_cancel_kb(),
+    )
+
+
+@router.message(EditProfileForm.edit_age_max, F.text)
+async def edit_input_age_max(message: Message, state: FSMContext):
+    txt = (message.text or "").strip()
+    if not txt.isdigit() or not (18 <= int(txt) <= 99):
+        await message.answer("Возраст — число от 18 до 99.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    max_age = int(txt)
+    data = await state.get_data()
+    min_age = data.get("age_min", 18)
+    if max_age < min_age:
+        await message.answer(f"Максимум не может быть меньше минимума ({min_age}).",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id,
+                                    partner_age_min=min_age,
+                                    partner_age_max=max_age)
+    await state.clear()
+    await message.answer(
+        f"✅ Диапазон: {min_age}–{max_age}. Что ещё?",
+        reply_markup=_edit_menu_kb(),
+    )
+
+
+@router.message(EditProfileForm.edit_city, F.text)
+async def edit_input_city(message: Message, state: FSMContext):
+    city = (message.text or "").strip()
+    if not (2 <= len(city) <= 50):
+        await message.answer("Город от 2 до 50 символов.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, city=city)
+    await state.clear()
+    await message.answer(f"✅ Город: {city}. Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+@router.message(EditProfileForm.edit_denomination_other, F.text)
+async def edit_input_denom_other(message: Message, state: FSMContext):
+    denom = (message.text or "").strip()
+    if not (2 <= len(denom) <= 50):
+        await message.answer("От 2 до 50 символов.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, denomination=denom)
+    await state.clear()
+    await message.answer(f"✅ Конфессия: {denom}. Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+@router.message(EditProfileForm.edit_church, F.text)
+async def edit_input_church(message: Message, state: FSMContext):
+    ch = (message.text or "").strip()
+    if not (2 <= len(ch) <= 100):
+        await message.answer("От 2 до 100 символов.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, church=ch)
+    await state.clear()
+    await message.answer(f"✅ Церковь: {ch}. Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+@router.message(EditProfileForm.edit_church_role, F.text)
+async def edit_input_church_role(message: Message, state: FSMContext):
+    role = (message.text or "").strip()
+    if not (2 <= len(role) <= 100):
+        await message.answer("От 2 до 100 символов.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, church_role=role)
+    await state.clear()
+    await message.answer(f"✅ Служение: {role}. Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+@router.message(EditProfileForm.edit_job, F.text)
+async def edit_input_job(message: Message, state: FSMContext):
+    job = (message.text or "").strip()
+    if not (2 <= len(job) <= 100):
+        await message.answer("От 2 до 100 символов.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, job=job)
+    await state.clear()
+    await message.answer(f"✅ Работа/учёба: {job}. Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+@router.message(EditProfileForm.edit_hobbies, F.text)
+async def edit_input_hobbies(message: Message, state: FSMContext):
+    hobbies = (message.text or "").strip()
+    if not (10 <= len(hobbies) <= 500):
+        await message.answer("От 10 до 500 символов.",
+                             reply_markup=_edit_cancel_kb())
+        return
+    await db.update_profile_fields(message.from_user.id, hobbies=hobbies)
+    await state.clear()
+    await message.answer("✅ Описание обновлено. Что ещё?",
+                         reply_markup=_edit_menu_kb())
+
+
+# ---- Загрузка фото заново ----
+
+@router.message(EditProfileForm.edit_photos, F.photo)
+async def edit_input_photos(message: Message, state: FSMContext):
+    """Приём фото при редактировании — накапливаем во временном списке."""
+    data = await state.get_data()
+    new_photos = data.get("new_photos", [])
+    if len(new_photos) >= 5:
+        await message.answer("Уже 5 фото — больше не нужно. Нажми «✅ Готово».")
+        return
+
+    file_id = message.photo[-1].file_id
+    user_id = message.from_user.id
+
+    # Скачиваем во временную папку, потом переместим
+    tmp_dir = _os.path.join("/tmp", f"edit_photos_{user_id}")
+    _os.makedirs(tmp_dir, exist_ok=True)
+    pos = len(new_photos)
+    tmp_path = _os.path.join(tmp_dir, f"{pos}.jpg")
+
+    ok = await photo_utils.download_tg_photo(bot, file_id, tmp_path)
+    if not ok:
+        logging.warning(f"edit: не смог скачать фото {file_id}")
+        tmp_path = None
+
+    new_photos.append({"photo_id": file_id, "file_path": tmp_path})
+    await state.update_data(new_photos=new_photos)
+
+    count = len(new_photos)
+    if count < 2:
+        text = f"Принято {count}/5. Нужно ещё минимум одно."
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="◀ Отмена",
+                                  callback_data="edit:cancel_field"),
+        ]])
+    else:
+        text = f"Принято {count}/5. Можно добавить ещё или нажать «Готово»."
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"✅ Готово ({count}/5)",
+                                  callback_data="edit:photos_done")],
+            [InlineKeyboardButton(text="◀ Отмена",
+                                  callback_data="edit:cancel_field")],
+        ])
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "edit:photos_done")
+async def edit_photos_done(call: CallbackQuery, state: FSMContext):
+    """Финализация — перемещаем фото в основную папку и обновляем БД."""
+    data = await state.get_data()
+    new_photos = data.get("new_photos", [])
+    if len(new_photos) < 2:
+        await call.answer("Нужно минимум 2 фото!", show_alert=True)
+        return
+
+    user_id = call.from_user.id
+    await call.answer("Сохраняю…")
+
+    # 1. Удаляем старые файлы из основной папки
+    import shutil
+    main_dir = db.user_photos_dir(user_id)
+    if _os.path.exists(main_dir):
+        try:
+            for f in _os.listdir(main_dir):
+                fp = _os.path.join(main_dir, f)
+                if _os.path.isfile(fp):
+                    _os.remove(fp)
+        except Exception as e:
+            logging.warning(f"edit photos: не смог очистить старые файлы: {e}")
+    _os.makedirs(main_dir, exist_ok=True)
+
+    # 2. Перемещаем новые из /tmp в основную папку
+    final_photos = []
+    for idx, p in enumerate(new_photos):
+        src = p.get("file_path")
+        target = _os.path.join(main_dir, f"{idx}.jpg")
+        if src and _os.path.exists(src):
+            try:
+                shutil.move(src, target)
+                final_photos.append({"photo_id": p["photo_id"],
+                                      "file_path": target})
+            except Exception as e:
+                logging.warning(f"edit photos move failed: {e}")
+                final_photos.append({"photo_id": p["photo_id"],
+                                      "file_path": None})
+        else:
+            final_photos.append({"photo_id": p["photo_id"], "file_path": None})
+
+    # 3. Удаляем tmp-папку
+    tmp_dir = _os.path.join("/tmp", f"edit_photos_{user_id}")
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    # 4. Обновляем записи в БД (user_photos)
+    # Нам нужна функция которая заменит фото у юзера — используем raw SQL
+    await db.replace_user_photos(user_id, final_photos)
+
+    await state.clear()
+    try:
+        await call.message.edit_text(
+            f"✅ Фото обновлены ({len(final_photos)} шт.). Что ещё?",
+            reply_markup=_edit_menu_kb(),
+        )
+    except Exception:
+        await bot.send_message(
+            user_id,
+            f"✅ Фото обновлены ({len(final_photos)} шт.). Что ещё?",
+            reply_markup=_edit_menu_kb(),
+        )
+
+
+@router.message(EditProfileForm.edit_photos)
+async def edit_photos_fallback(message: Message, state: FSMContext):
+    """Не-фото сообщение в состоянии загрузки фото."""
+    await message.answer("Пришли <b>фотографию</b> (не текст).")
 
 
 async def scheduler_loop():
