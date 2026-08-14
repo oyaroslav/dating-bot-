@@ -1622,3 +1622,19 @@ async def replace_user_photos(user_id: int, photos: list) -> None:
             (cover.get("photo_id"), cover.get("file_path"), user_id),
         )
         await conn.commit()
+
+
+# ============= ВАЛИДАТОР «О СЕБЕ» =============
+
+def count_meaningful_words(text: str, min_word_len: int = 2) -> int:
+    """Считает количество осмысленных слов в тексте.
+    Слово = последовательность непробельных символов длиной >= min_word_len.
+    Используется для валидации «О себе» — минимум 10 таких слов."""
+    if not text:
+        return 0
+    words = text.strip().split()
+    return sum(1 for w in words if len(w) >= min_word_len)
+
+
+HOBBIES_MIN_WORDS = 10  # минимум слов в «О себе» для новых анкет
+HOBBIES_MIN_WORD_LEN = 2  # каждое слово — минимум 2 символа

@@ -681,7 +681,10 @@ async def handle_form_children(vk_user_id: int, text: str):
     set_state(vk_user_id, "hobbies")
     send_message(
         vk_user_id,
-        "Расскажи о себе и своих интересах (до 500 символов).",
+        "Расскажи о себе — минимум 10 слов.\n\n"
+        "Опиши работу, увлечения, что важно в отношениях, что ищешь.\n\n"
+        "Пример: «Люблю читать классику, играю на гитаре в служении, "
+        "увлекаюсь походами. Ищу верующую жену для крепкой христианской семьи.»",
         keyboard=empty_keyboard(),
     )
 
@@ -690,6 +693,16 @@ async def handle_form_hobbies(vk_user_id: int, text: str):
     hobbies = text.strip()
     if not (1 <= len(hobbies) <= 500):
         send_message(vk_user_id, "От 1 до 500 символов.")
+        return
+    word_count = db.count_meaningful_words(hobbies, db.HOBBIES_MIN_WORD_LEN)
+    if word_count < db.HOBBIES_MIN_WORDS:
+        send_message(
+            vk_user_id,
+            f"Слишком коротко — минимум {db.HOBBIES_MIN_WORDS} слов "
+            f"(у тебя {word_count}).\n\n"
+            f"Расскажи подробнее о себе, работе, увлечениях, что важно "
+            f"в отношениях.",
+        )
         return
     update_data(vk_user_id, hobbies=hobbies, photos=[])
     set_state(vk_user_id, "photo")
@@ -2757,7 +2770,7 @@ async def handle_vedit_callback(vk_user_id: int, payload: dict):
             set_state(vk_user_id, "vedit_hobbies")
             send_message(vk_user_id,
                          "📝 Пришли новое описание «О себе» "
-                         "(10-500 символов):",
+                         "— минимум 10 слов:",
                          keyboard=_vedit_cancel_kb())
         elif field == "photos":
             set_state(vk_user_id, "vedit_photos", vedit_new_photos=[])
@@ -2996,6 +3009,17 @@ async def handle_vedit_hobbies(vk_user_id: int, text: str):
     if not (10 <= len(hobbies) <= 500):
         send_message(vk_user_id, "От 10 до 500 символов.",
                      keyboard=_vedit_cancel_kb())
+        return
+    word_count = db.count_meaningful_words(hobbies, db.HOBBIES_MIN_WORD_LEN)
+    if word_count < db.HOBBIES_MIN_WORDS:
+        send_message(
+            vk_user_id,
+            f"Слишком коротко — минимум {db.HOBBIES_MIN_WORDS} слов "
+            f"(у тебя {word_count}).\n\n"
+            f"Расскажи подробнее о себе, работе, увлечениях, что важно "
+            f"в отношениях.",
+            keyboard=_vedit_cancel_kb(),
+        )
         return
     db_id = db.vk_id_to_db_id(vk_user_id)
     await db.update_profile_fields(db_id, hobbies=hobbies)

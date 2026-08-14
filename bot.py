@@ -1080,8 +1080,12 @@ async def form_children(message: Message, state: FSMContext):
         return
     await state.update_data(children=message.text)
     await message.answer(
-        "<b>Расскажи о своих хобби и увлечениях</b> (1–500 символов).\n"
-        "Например: «Люблю читать, играю на гитаре в служении, увлекаюсь походами».",
+        "<b>Расскажи о себе</b> — минимум <b>10 слов</b>.\n\n"
+        "Опиши работу, увлечения, что важно в отношениях, что ищешь. "
+        "Чем подробнее — тем интереснее твоя анкета.\n\n"
+        "Пример: «Люблю читать классику, играю на гитаре в служении молитвы, "
+        "увлекаюсь походами в горы. Ищу верующую жену, готовую строить "
+        "христианскую семью.»",
         reply_markup=ReplyKeyboardRemove(),
     )
     await state.set_state(Form.hobbies)
@@ -1092,6 +1096,16 @@ async def form_hobbies(message: Message, state: FSMContext):
     hobbies = (message.text or "").strip()
     if not (1 <= len(hobbies) <= 500):
         await message.answer("От 1 до 500 символов. Попробуй ещё раз.")
+        return
+    # Проверка минимального числа слов
+    word_count = db.count_meaningful_words(hobbies, db.HOBBIES_MIN_WORD_LEN)
+    if word_count < db.HOBBIES_MIN_WORDS:
+        await message.answer(
+            f"Слишком коротко — минимум <b>{db.HOBBIES_MIN_WORDS} слов</b> "
+            f"(у тебя {word_count}).\n\n"
+            f"Расскажи подробнее о себе, работе, увлечениях, что важно "
+            f"в отношениях."
+        )
         return
     await state.update_data(hobbies=hobbies)
     await message.answer(
@@ -3614,7 +3628,7 @@ async def edit_field_hobbies(call: CallbackQuery, state: FSMContext):
     await state.set_state(EditProfileForm.edit_hobbies)
     await bot.send_message(
         call.from_user.id,
-        "📝 Пришли <b>новое описание</b> «О себе» (10-500 символов):",
+        "📝 Пришли <b>новое описание</b> «О себе» — минимум <b>10 слов</b>:",
         reply_markup=_edit_cancel_kb(),
     )
 
@@ -3792,6 +3806,16 @@ async def edit_input_hobbies(message: Message, state: FSMContext):
     if not (10 <= len(hobbies) <= 500):
         await message.answer("От 10 до 500 символов.",
                              reply_markup=_edit_cancel_kb())
+        return
+    word_count = db.count_meaningful_words(hobbies, db.HOBBIES_MIN_WORD_LEN)
+    if word_count < db.HOBBIES_MIN_WORDS:
+        await message.answer(
+            f"Слишком коротко — минимум <b>{db.HOBBIES_MIN_WORDS} слов</b> "
+            f"(у тебя {word_count}).\n\n"
+            f"Расскажи подробнее о себе, работе, увлечениях, что важно "
+            f"в отношениях.",
+            reply_markup=_edit_cancel_kb(),
+        )
         return
     await db.update_profile_fields(message.from_user.id, hobbies=hobbies)
     await state.clear()
